@@ -1,0 +1,11 @@
+[Event "Endgame Study"]
+[Site "Chess Master Test Suite"]
+[Date "2026.10.21"]
+[Round "-"]
+[White "Study"]
+[Black "Study"]
+[Result "1-0"]
+[SetUp "1"]
+[FEN "7k/5Q2/6K1/8/8/8/8/8 w - - 0 1"]
+
+1. Qg7# 1-0

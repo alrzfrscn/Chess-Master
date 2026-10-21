@@ -1,0 +1,17 @@
+[Event "Ruy Lopez Study"]
+[Site "Chess Master Test Suite"]
+[Date "2026.10.21"]
+[Round "1"]
+[White "Alice"]
+[Black "Bob"]
+[Result "1-0"]
+[WhiteElo "2100"]
+[BlackElo "2000"]
+[WhiteTitle "IM"]
+[Annotator "A. Tester"]
+[Comment "A header block that spans many lines and exercises the parser"]
+
+{Starting comment before the first move.}
+1. e4 {King's pawn} e5 ; a semicolon comment that runs to the end of the line
+2. Nf3 Nc6 3. Bb5 a6 {Main line} 4. Ba4 Nf6 5. O-O Be7 6. Re1 b5
+7. Bb3 d6 8. c3 O-O 9. h3 Nb8 10. d4 Nbd7 1-0

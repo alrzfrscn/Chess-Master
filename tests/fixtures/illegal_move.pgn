@@ -1,0 +1,8 @@
+[Event "Illegal move"]
+[Site "Chess Master Test Suite"]
+[Date "2026.10.21"]
+[White "White"]
+[Black "Black"]
+[Result "*"]
+
+1. e4 e5 2. Bh6 *

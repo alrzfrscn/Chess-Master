@@ -1,0 +1,19 @@
+{
+  "name": "chess-master-ui",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Build tooling for the Chess Master web UI (Tailwind v4 + Chessground + chess.js).",
+  "scripts": {
+    "vendor": "node scripts/sync_vendor.mjs",
+    "css": "tailwindcss -i src/chess_master/web/src/styles.css -o src/chess_master/web/assets/css/app.css --minify",
+    "build": "npm run vendor && npm run css",
+    "watch": "tailwindcss -i src/chess_master/web/src/styles.css -o src/chess_master/web/assets/css/app.css --watch"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.0",
+    "chess.js": "1.4.0",
+    "chessground": "9.2.1",
+    "tailwindcss": "^4.1.0"
+  }
+}
