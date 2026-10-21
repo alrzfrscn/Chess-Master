@@ -33,7 +33,7 @@ def assert_error(response: dict, code: str) -> dict:
 
 def test_api_info(api: ChessMasterApi) -> None:
     data = assert_ok(api.get_api_info())
-    assert data["phase"] == 2
+    assert data["phase"] == 3
     assert data["analysis"]["winprob"] == "lichess-logistic"
     assert set(
         [
@@ -54,6 +54,13 @@ def test_api_info(api: ChessMasterApi) -> None:
     assert data["capabilities"]["engine"] is True
     assert data["capabilities"]["live_evaluation"] is True
     assert data["capabilities"]["best_move_arrows"] is True
+    assert data["capabilities"]["game_review"] is True
+    assert data["capabilities"]["review_presets"] == ["fast", "standard", "deep"]
+    assert {
+        "start_game_review",
+        "cancel_game_review",
+        "get_game_review",
+    }.issubset(set(data["methods"]))
     assert data["elo"]["min"] == 400
     assert data["elo"]["max"] == 3000
     assert len(data["elo"]["presets"]) == 7
@@ -64,6 +71,25 @@ def test_get_game_state_initial(api: ChessMasterApi) -> None:
     assert state["ply"] == 0
     assert state["fen"].startswith("rnbqkbnr/pppppppp")
     assert state["players"]["white"]["name"] == "White"
+    assert state["review"]["status"] == "idle"
+    assert state["review"]["available"] is False
+
+
+def test_review_requires_a_move_and_a_known_preset(api: ChessMasterApi) -> None:
+    error = assert_error(api.start_game_review("standard"), "invalid_input")
+    assert "at least one move" in error["message"].lower()
+    assert_error(api.start_game_review("turbo"), "invalid_input")
+    assert_error(api.start_game_review("fast", {"use_book": "yes"}), "invalid_input")
+
+
+def test_idle_review_can_be_read_and_cancelled(api: ChessMasterApi) -> None:
+    data = assert_ok(api.get_game_review())
+    assert data["review"]["status"] == "idle"
+    assert data["report"] is None
+
+    data = assert_ok(api.cancel_game_review())
+    assert data["review"]["status"] == "idle"
+    assert data["review"]["reason"] == "user"
 
 
 def test_new_game_and_move(api: ChessMasterApi) -> None:
@@ -141,6 +167,7 @@ def test_every_response_is_json_serializable(api: ChessMasterApi) -> None:
         api.export_pgn(),
         api.reset_game(),
         api.get_samples(),
+        api.get_game_review(),
     ]
     for response in responses:
         json.dumps(response)

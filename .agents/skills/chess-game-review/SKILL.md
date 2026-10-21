@@ -9,6 +9,16 @@ Single source of truth for the review engine. Keep formulas here, not scattered
 through Python or JavaScript. When a number changes, change it here first, then
 update the implementation and its tests.
 
+Phase 3 implementation lives in:
+
+- `src/chess_master/analysis/review.py` — two-pass pipeline and report
+- `src/chess_master/analysis/classifier.py` — ten labels and Brilliant/Great gates
+- `src/chess_master/analysis/metrics.py` — accuracy, ACPL, phases, estimated Elo
+- `src/chess_master/analysis/openings.py` — bundled ECO trie and Polyglot extension
+- `src/chess_master/analysis/winprob.py` — Lichess logistic and accuracy curves
+- `src/chess_master/engine/stockfish.py` — worker, MultiPV searches and cache
+- `src/chess_master/engine/coordinator.py` — review lifecycle and invalidation
+
 ## When to Use
 
 - Wiring Stockfish over UCI with `python-chess`
@@ -16,7 +26,7 @@ update the implementation and its tests.
 - Converting centipawn and mate scores into win probability
 - Computing centipawn loss, win% loss, accuracy, ACPL
 - Classifying moves (Best, Excellent, Good, Book, Inaccuracy, Mistake,
-  Blunder, Miss, Great, Brilliant, Forced)
+  Blunder, Miss, Great, Brilliant; Forced is metadata, not an eleventh label)
 - Estimating player Elo or building the review summary
 - Defining the Python ↔ JavaScript payload for the frontend
 - Debugging "the review says I blundered a winning position"
@@ -25,35 +35,41 @@ update the implementation and its tests.
 
 1. **One engine process, one owner thread.** A `chess.engine` object is not
    thread-safe. Own it from a single worker; feed it jobs through a queue.
-2. **Never block the UI thread.** PyWebView's JS bridge call must return
-   immediately with a job id; stream progress through `evaluate_js` events.
-3. **All comparisons use the same point of view.** Normalize every score to
-   White POV for storage, then convert to the mover's POV only for display.
-4. **Keep the engine's best move separate from the played move.** MultiPV >= 2
-   lets you score the played move even when it is not in the top line, but the
-   POV loss must always be measured against the engine's #1 line.
+2. **Never block the UI thread.** The JS bridge call returns immediately with a
+   job/review id; progress is polled through the compact state block.
+3. **All comparisons use the same point of view.** Store every score in White
+   POV. Convert to the mover's POV only for win%, cp loss and display.
+4. **Keep the engine's best move separate from the played move.** MultiPV 3
+   lets us identify the played move's rank even when it is outside the top
+   line. The reference is always the engine's #1 line.
 5. **Mate scores are not centipawns.** Convert mates to win% 0/100 and to a
    bounded pseudo-cp value; never feed 100000 into an exponential formula.
-6. **Flag forced and book positions before classifying.** A move with one legal
-   reply cannot be a blunder. A book move should not be graded on raw cp loss.
+6. **Book and forced positions are special.** A book move is never graded on
+   cp loss. A forced move is labelled `best`, carries `is_forced: true`, and is
+   excluded from accuracy/ACPL aggregation.
+7. **Brilliant and Great are two-pass labels.** Pass 1 may flag a candidate;
+   pass 2 must re-search its surrounding positions two plies deeper before the
+   label is final. Pass 2 may downgrade a candidate.
 
 ## Pipeline
 
 ```
 PGN / move list
-  → validate & replay with python-chess (board.fen(), board.move_stack)
-  → detect opening book + forced moves + game phase
-  → per ply: engine analyse position with MultiPV=2+ (fixed depth)
-  → store best eval, played-move eval, best move, PV, depth
-  → normalize scores to White POV
-  → win% before/after → loss → move accuracy
-  → classify → aggregate (ACPL, game accuracy, estimated Elo, counts)
-  → cache per (fen, depth, multipv, engine version)
-  → emit ReviewPayload to the frontend
+  -> validate and replay with python-chess (boards[0..N])
+  -> detect ECO / Polyglot book prefix -> last_book_ply
+  -> determine forced moves and phase for each ply
+  -> needed positions = last_book_ply .. N (skip if the whole game is book)
+  -> PASS 1: MultiPV=3 at the preset depth
+  -> initial grading -> flag Brilliant/Great candidates
+  -> PASS 2: re-search {ply-1, ply} per candidate at min(depth+2, 18)
+             up to three rounds, then re-grade
+  -> win sequence -> accuracy / ACPL / phase splits / estimated Elo
+  -> versioned review report + compact progress block
 ```
 
-Analyze each position **once**, at the same depth, with the same engine build.
-Mixed depths make accuracy numbers meaningless and non-reproducible.
+Pass 1 analyses every position that is the "before" or "after" position of a
+non-book ply. The final position is included when the last move is non-book.
+Terminal positions are synthesized without starting Stockfish.
 
 ## Stockfish UCI contract
 
@@ -69,37 +85,47 @@ isready
 ucinewgame
 ```
 
-`UCI_ShowWDL` is optional but useful: Stockfish's own WDL model is a second,
-better-calibrated opinion than raw cp, and it exposes draw probability, which
-plain win% hides.
+`UCI_ShowWDL` is optional diagnostics; the review math uses the Lichess
+logistic model below.
+
+### Presets
+
+| Preset | Pass 1 depth | Pass 2 depth | MultiPV |
+|--------|--------------|--------------|---------|
+| fast | 10 | 12 | 3 |
+| standard | 14 | min(16, 18) = 16 | 3 |
+| deep | 16 | min(18, 18) = 18 | 3 |
+
+A custom `depth` is allowed only from 6 to 24. Its confirmation depth is
+`min(depth + 2, 18)`. If the base depth is already 18 or higher, pass 2 cannot
+add depth and candidates remain visibly unconfirmed rather than pretending.
 
 ### Position and search
 
 ```
 position startpos moves e2e4 e7e5 g1f3
 position fen <FEN> moves <uci moves>
-go depth 18
-go movetime 1500
-go nodes 2000000
+go depth 14
 stop
 quit
 ```
 
 Depth, not movetime, for review: identical depth gives reproducible grades.
-Use `movetime` only for a fast "instant review" mode and label it as such.
+Use `movetime` only for a fast "instant review" mode, and never mix its results
+with a fixed-depth review.
 
 ### Parsing `info`
 
 ```
-info depth 16 seldepth 21 multipv 1 score cp 34 nodes ... nps ... pv e2e4 e7e5 ...
+info depth 16 seldepth 21 multipv 1 score cp 34 nodes ... pv e2e4 e7e5 ...
 info depth 16 multipv 2 score mate -3 ... pv ...
 info depth 16 multipv 3 score cp -120 ... pv d7d5 ...
 bestmove e2e4 ponder e7e5
 ```
 
-- `multipv 1` is the engine's best line; lower `multipv` indices are better.
-- `score cp` and `score mate` are relative to the **side to move**.
-- `score mate 0` means the side to move is already checkmated (or will be).
+- `multipv 1` is the engine's best line; lower indices are better.
+- `score cp` and `score mate` are relative to the side to move.
+- `score mate 0` means the side to move is already checkmated.
 - The last `info` before `bestmove` for a given `multipv` is the deepest.
 - Ignore `info currmove`, `info string`, and lines without `pv` for grading.
 
@@ -111,25 +137,27 @@ import chess, chess.engine
 engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
 engine.configure({"Threads": 2, "Hash": 256, "MultiPV": 3})
 
-infos = engine.analyse(
-    board,
-    chess.engine.Limit(depth=18),
-    multipv=3,
-)
-# infos is a list, one dict per PV; [0] is best
+infos = engine.analyse(board, chess.engine.Limit(depth=14), multipv=3)
 best = infos[0]
-score = best["score"].pov(chess.WHITE)   # PovScore → White POV
+score = best["score"].pov(chess.WHITE)   # PovScore -> White POV
 ```
 
-- `SimpleEngine` is fine when you drive one analysis loop. `UCIEngine` is
-  needed for `engine.analysis()` streaming `info` updates while a search runs.
-- `engine.ping()` is a cheap health check; call it after startup.
-- `engine.quit()` in a `finally` block, and guard against a dead process.
-- `chess.engine.Limit(depth=18)` must stay in sync with the cache key.
-- `board.fen()` loses the move history; use `board.move_stack` / `position
-  startpos moves ...` when repetition and fifty-move context matter.
+- `SimpleEngine` is fine when one worker owns the loop.
+- `UCIEngine` is needed for streaming `info` updates during a search.
+- `engine.quit()` in `finally`, and guard against a dead process.
+- Cache key must include depth, multipv, engine version and model version.
 
-### Score normalization
+### Terminal positions
+
+Do not start a search for:
+
+- checkmate: synthetic line with White win probability 100 or 0
+- stalemate / insufficient material / seventy-five moves / fivefold repetition:
+  synthetic draw with 50% and terminal CP 0
+
+The pipeline counts these as `timing.terminal_positions`.
+
+## Score normalization
 
 ```python
 MATE_CP = 10_000
@@ -139,7 +167,7 @@ def to_white_cp(score: chess.engine.PovScore) -> int:
     if white.is_mate():
         mate = white.mate()              # >0 White mates, <0 Black mates
         if mate == 0:
-            return -MATE_CP if white.turn is None else 0
+            return -MATE_CP
         sign = 1 if mate > 0 else -1
         return sign * (MATE_CP - abs(mate) * 100)
     return white.score(mate_score=MATE_CP)
@@ -148,57 +176,47 @@ def to_white_cp(score: chess.engine.PovScore) -> int:
 Rules:
 
 - Store **White POV cp** in the review data.
-- For grading a move by White, use `cp`; for Black, negate it.
-- Cap ordinary cp at `±1500` (or `±1000`) before win% conversion. Without a cap
-  a +30 pawn eval saturates accuracy for the rest of the game.
-- Mate distance matters: mate in 1 is stronger than mate in 8. The
-  `MATE_CP - 100*n` encoding preserves that ordering.
+- For grading Black, negate the cp delta.
+- Ordinary Game Review scores are clamped to **±1000 cp** before win%
+  conversion. This is `REVIEW_CP_CEILING`.
+- The Phase 1/2 helpers keep the older **±1500 cp** ceiling and the rounded
+  accuracy curve; do not silently change stored Phase 1 values.
+- Mate distance matters: mate in 1 is stronger than mate in 8 because the
+  pseudo-cp magnitude decreases with distance.
 
 ## Win probability
 
-Two accepted models. Pick one per project and version the choice in the cache
-key, because swapping models changes every accuracy score.
-
-### Model A — Elo expectation (simple, transparent)
+The canonical Game Review model is the Lichess logistic:
 
 ```
-W(cp) = 1 / (1 + 10 ** (-cp / 400))
+W(cp) = 100 / (1 + exp(-0.00368208 * cp))
 ```
 
-`W` is White's expected score in [0, 1]. Symmetric, easy to explain, but too
-steep near 0 and too flat at large advantages.
+with `cp` clamped to `[-1000, +1000]`. Result is a percentage in `[0, 100]`.
+`W(0) = 50`.
 
-### Model B — Lichess logistic (recommended)
-
-```
-W(cp) = 50 + 50 * (2 / (1 + exp(-0.00368208 * cp)) - 1)
-```
-
-Result is a percentage in [0, 100]. This is the public Lichess model and is
-well behaved across the whole eval range.
+Mate endpoints:
 
 ```
-mate for White  → W = 100
-mate for Black  → W = 0
-|cp| > 1500     → clamp before evaluating
+mate for White -> 100
+mate for Black -> 0
 ```
+
+The standard-start prior is **+15 cp for White**:
+
+```
+W_prior = W(15) = 51.382...%
+```
+
+This prior is only used for position 0 of the standard start. A custom start
+uses its first real evaluation, or 50% if no position can be searched.
 
 For display, round to one decimal. For math, keep full float precision and
 round only at the end.
 
 ### Win% loss
 
-```
-loss_win = max(0, W_before - W_after)
-```
-
-- `W_before` = win% of the position **before** the move, from the engine's best
-  line (the position is the same for both players).
-- `W_after` = win% of the position **after** the played move, from the mover's
-  POV.
-- Both must be from the same player's perspective. Compute in White POV, then
-  flip both to the mover's POV, or compute in White POV and use the mover's
-  sign consistently.
+Work in White POV, then flip both values to the mover's POV:
 
 ```
 W_mover_before = W_white_before            if mover == WHITE else 100 - W_white_before
@@ -206,249 +224,497 @@ W_mover_after  = W_white_after             if mover == WHITE else 100 - W_white_
 loss_win       = max(0, W_mover_before - W_mover_after)
 ```
 
+`W_before` is the engine's #1 line in the position before the move.
+`W_after` is the engine's #1 line in the position after the played move.
+
 ### Centipawn loss
 
 ```
-cp_loss = max(0, cp_best_for_mover - cp_played_for_mover)
+delta_white = clamp1000(cp_before_white) - clamp1000(cp_after_white)
+cp_loss     = max(0, min(1000, delta_white if mover == WHITE else -delta_white))
 ```
 
-For the played move, the "eval after" is the engine's eval of the resulting
-position, **not** the eval of the move itself. If the played move is the best
-move, `cp_loss = 0` by definition.
-
-Clamp `cp_loss` at `1000` for aggregation so one lost position cannot dominate
-a game average.
+If the played move is the engine's #1 line, `cp_loss` and `win_loss` are
+**forced to 0**. Shallow eval drift between the before/after searches must not
+charge the engine's own top choice a loss. Book moves store `cp_loss: null`
+and are excluded from aggregation.
 
 ## Accuracy
 
-### Per-move accuracy (Chess.com-style curve)
+### Per-move accuracy (canonical review curve)
+
+For `loss_win <= 0`, accuracy is exactly `100.0`. Otherwise:
 
 ```
-accuracy_move = 103.1668 * exp(-0.04354 * loss_win) - 3.1669
+accuracy_move = 103.1668100711649 * exp(-0.04354415386753951 * loss_win)
+                - 3.166924740191411
+                + 1.0
 accuracy_move = clamp(accuracy_move, 0, 100)
 ```
 
-`loss_win` is in **percentage points** (0–100), not a fraction. This is the
-widely used community reverse-engineering of Chess.com's curve; treat it as a
-calibration target, not an official spec.
+The `+1.0` is the canonical uncertainty bonus. `loss_win` is in **percentage
+points** (0–100), not a fraction.
 
-Properties to preserve when you refactor:
+The legacy Phase 1/2 curve is frozen at the rounded community constants and
+has **no** bonus:
 
-- `loss_win = 0` → ~100%
-- `loss_win = 10` → ~68%
-- `loss_win = 20` → ~44%
-- `loss_win = 30` → ~29%
-- Monotonically decreasing, asymptotic to ~-3.17 before clamping.
+```
+accuracy_legacy = clamp(
+    103.1668 * exp(-0.04354 * loss_win) - 3.1669,
+    0, 100,
+)
+```
 
-A useful sanity check: a single 30-point win% swing should not drop a 40-move
-game below ~90% game accuracy. If it does, you are averaging wrong.
+Do not replace the legacy helper with the review helper. Stored Phase 1
+payloads and their tests depend on the exact rounded values.
 
 ### Game accuracy
 
-Do **not** use a plain arithmetic mean: it lets one blunder be diluted by 30
-easy moves, and it over-rewards a game with no decisions.
+Do **not** use a plain arithmetic mean. The canonical aggregate is a 50/50
+blend of the volatility-weighted mean and the harmonic mean over counted
+moves (non-book, non-forced).
 
-Recommended aggregate:
-
-```
-game_accuracy = weighted_harmonic_mean(move_accuracies, weights=difficulty)
-```
-
-with a fallback to the arithmetic mean when fewer than 5 non-forced,
-non-book moves exist. Chess.com emphasizes difficult positions; a practical
-weight is:
+For `N` counted moves, the window length is:
 
 ```
-difficulty = 1 + (loss_win_possible / 100)   # or volatility of the position
+L = clamp(floor(N / 10), 2, 8)
 ```
 
-Simpler, still defensible: arithmetic mean over non-forced, non-book moves,
-then apply a penalty proportional to the blunder rate. Document whichever is
-chosen and keep it stable across releases.
+`win_probs_white` is the sequence of positions `0..N`. Build boundary padding
+by prefixing `(L - 2)` copies of the initial window `W[0:L]`. For move `j`
+(0-based), the weight is the **population** standard deviation of
+`padded[j : j + L]`, clamped to `[0.5, 12.0]` percentage points.
+
+```
+A_weighted = sum(a_i * w_i) / sum(w_i)
+A_harmonic = |M| / sum(1 / max(a_i, 1.0))
+accuracy   = clamp((A_weighted + A_harmonic) / 2, 0, 100)
+```
+
+If there are no counted moves, accuracy is `null`. The report also exposes
+`weighted_accuracy` and `harmonic_accuracy` separately for debugging.
 
 ### ACPL
 
 ```
-ACPL = mean(cp_loss for graded moves)     # exclude forced and book moves
+ACPL_raw = mean(cp_loss for counted moves with a cp loss)
 ```
 
-Report ACPL separately for White and Black, and cap per-move loss at 1000.
-ACPL and accuracy are not interchangeable: ACPL is linear in eval, accuracy is
-nonlinear in win%.
+For 8 or more scored moves, trim the highest `ceil(0.10 * n)` losses before
+taking the mean. With fewer than 8, use the raw mean. Per-move `cp_loss` is
+capped at 1000. Forced and book moves are excluded.
+
+`ACPL_raw` and `ACPL_trimmed` are both reported. Accuracy and ACPL are not
+interchangeable: ACPL is linear in eval, accuracy is nonlinear in win%.
 
 ### Estimated Elo
 
-Estimated Elo is a heuristic mapping from accuracy + ACPL, not a rating
-calculation. Publish it as an estimate and calibrate against real games:
+Single-game heuristic, clamped to `[400, 3000]` and rounded to the nearest 50.
 
-| Accuracy | Rough Elo band |
-|----------|----------------|
-| 95–100   | 2200+          |
-| 90–94    | 1900–2200      |
-| 85–89    | 1600–1900      |
-| 80–84    | 1400–1600      |
-| 70–79    | 1100–1400      |
-| 60–69    | 800–1100       |
-| < 60     | < 800          |
+Unanchored:
 
-Prefer a small regression on (accuracy, ACPL, game length) fitted to labelled
-games over a hard-coded table. Store coefficients here when fitted.
+```
+acpl_component     = 3100 * exp(-0.01 * acpl_trim)
+accuracy_component = 400 + 2600 / (1 + exp(-0.10 * (accuracy - 75)))
+blend              = 0.55 * acpl_component + 0.45 * accuracy_component
+penalty            = 700 * blunder_rate
+                   + 350 * mistake_rate
+                   + 3 * max(0, acpl_raw - acpl_trim)
+unanchored         = clamp(blend - penalty, 400, 3000)
+```
+
+Where the rates use counted moves as the denominator (the `graded_moves`
+argument passed by `player_metrics` is the counted-move count).
+
+Anchored around a supplied baseline rating:
+
+```
+expected_accuracy = 55 + 45 / (1 + exp(-(baseline - 1400) / 600))
+expected_acpl     = clamp(95 - 0.02 * baseline, 15, 95)
+delta_R           = 20 * (accuracy - expected_accuracy)
+                  - 4 * (acpl_trim - expected_acpl)
+anchored          = clamp(baseline + delta_R, 400, 3000)
+```
+
+If a baseline is supplied, the anchored value is displayed. Otherwise use the
+unanchored value. Publish it as an estimate, not a rating calculation.
 
 ## Move classification
 
-Thresholds are **starting points**, not truth. Tune against a labelled fixture
-set and record the version in the payload.
-
-| Label | Rule (win% loss unless stated) | Notes |
-|-------|-------------------------------|-------|
-| Book | Position found in opening book | Never grade on cp loss |
-| Forced | Exactly one legal move | Exempt from accuracy/ACPL |
-| Best | Played move == engine #1 | Always Best, even if eval is bad |
-| Excellent | `loss_win <= 2` | Near-perfect practical move |
-| Good | `loss_win <= 5` | Sound, small concession |
-| Inaccuracy | `5 < loss_win <= 10` | |
-| Mistake | `10 < loss_win <= 20` | |
-| Blunder | `loss_win > 20` | |
-| Miss | Blunder/mistake **and** a forced mate or winning tactic was available and missed | Overrides Blunder when mate was on the board |
-| Great | Only-move that holds the position, or the unique move that refutes the opponent's threat | Requires MultiPV evidence |
-| Brilliant | Best/Excellent move that is a genuine material sacrifice, not already completely winning, and not book | Rarest label; require all conditions |
-
-Guard rails that prevent absurd grades:
-
-- If the mover was already winning by > 90% win% and stays > 90%, do not label
-  a normal capture/recapture a Brilliant.
-- A move that is forced (only legal move, or all moves transpose) is Forced,
-  never Blunder — even if the position is lost.
-- If the game is already decided (|win%| > 95 for 3+ plies), suppress
-  Brilliant/Great.
-- `Miss` requires that the engine's best line contained mate or a decisive
-  material win; "you missed a +2" is a Mistake, not a Miss.
-- A sacrifice must actually lose material on the board after the best reply,
-  not merely be a temporary tactical offer the engine refutes.
-
-### Brilliant heuristic (explicit)
+Exactly ten public labels. **Forced is metadata**, not an eleventh label:
 
 ```
-is_brilliant =
-    label in {Best, Excellent}
-    and not is_book
-    and not is_forced
-    and material_after_best_reply <= material_before - SACRIFICE_MIN   # e.g. 200cp
-    and win_before < 90
-    and played_move in engine_top_n                                    # e.g. top 2
+brilliant, great, best, excellent, good, book, inaccuracy, mistake, miss, blunder
 ```
 
-Document `SACRIFICE_MIN` and `engine_top_n` here once chosen.
+Precedence in `classify_move`:
 
-## Phases and context
+1. **Book** — position is inside the detected ECO/Polyglot prefix. Never graded.
+2. **Forced** — exactly one legal move. Returns `best` with `is_forced: true`.
+3. **Brilliant** — all six gates plus pass-2 confirmation.
+4. **Great** — all Great gates plus pass-2 confirmation.
+5. **Best** — played rank is 1, or `win_loss <= 1e-9`.
+6. **Excellent** — `win_loss < 2`.
+7. **Good** — `win_loss < 5`.
+8. **Inaccuracy** — `5 <= win_loss < 10`.
+9. **Miss** — opponent's previous move was a mistake/blunder, the current move
+   loses at least 10 win% (or missed a forced mate), and the mover still holds
+   within 5 win% of the pre-error position. Miss is checked before Blunder.
+10. **Blunder** — `win_loss >= 20`, or walked into mate, or dropped a forced mate.
+11. **Mistake** — remaining `10 <= win_loss < 20`.
 
-- **Opening**: plies 1–20, or until the book is exhausted. Book moves get no
-  accuracy score but still appear in the move list.
-- **Middlegame**: default phase for grading.
-- **Endgame**: material below a threshold (e.g. no queens and <= 13 total
-  points) or `board.piece_map()` heuristics. Consider raising the depth here;
-  endgame accuracy is more sensitive to depth.
-- **Volatility**: positions where the top 3 moves span > 15 win% are "sharp".
-  Weight these more in game accuracy and use them to decide Great/Miss.
-- **Time pressure / clock**: if PGN has clocks, keep it for UI only; do not
-  mix it into engine math.
+The exact boundary of 20 is Blunder; 10 through 19.999 is a Mistake unless
+Miss applies. A forced move never becomes a Blunder.
 
-## Review payload (Python → JS)
+### Brilliant gates
 
-Keep the wire format stable and versioned. `eval` is always White POV cp.
+Using the pass-2 confirmation lines when available:
+
+1. **Engine optimality**: not book and (rank 1, or rank <= 3 with
+   `win_loss < 2`).
+2. **Board exchange**: the move leaves a friendly non-pawn piece genuinely en
+   prise. The moved piece counts, and another non-pawn counts only if the move
+   newly exposes it. Captured material must be strictly less than the
+   sacrificed piece's value.
+3. **Legal capture**: the opponent actually has a legal capture on the
+   sacrificed piece (pinned attackers do not count).
+4. **Not a trapped piece**: there is a non-sacrificial alternative within the
+   MultiPV lines, or the piece was not already unavoidably lost.
+5. **Floor and ceiling**: `win_after_mover >= 50` and
+   `win_before_mover <= 90`. Do not call a move Brilliant when the position was
+   already completely winning.
+6. **Structural**: not already in check, not a queen promotion, and at least
+   two legal moves existed.
+
+`is_brilliant = book == false && gate1 && gate2 && gate3 && gate4 && gate5 && gate6`
+
+Pass 1 sets `needs_confirmation: true` and `confirmed: false`. Pass 2
+re-searches the position before and after the move at `min(depth + 2, 18)` and
+re-runs the classifier. Only then may `confirmed` become true.
+
+### Great gates
+
+```
+not book
+and legal_move_count >= 2
+and (played_rank == 1 or win_loss <= 1.0)
+and multi_pv_cliff >= 10.0
+and win_before_mover <= 90.0
+and win_after_mover >= 50.0
+and not a trivial capture
+```
+
+`multi_pv_cliff` is the win% difference between the mover's #1 and #2 lines.
+A trivial capture is a capture on a square with no defenders. Great candidates
+also require pass-2 confirmation.
+
+### Miss gates
+
+```
+previous_move_classification in {mistake, blunder}
+and (win_loss >= 10 or missed_forced_mate)
+and (win_pre_opponent_error is None
+     or win_after_mover >= win_pre_opponent_error - 5)
+```
+
+`missed_forced_mate` is true when the mover had a forced mate before the move
+and no longer has one after it. Miss is evaluated before Blunder, so a missed
+mate is not merely reported as a generic blunder.
+
+### Blunder overrides
+
+Blunder also fires when:
+
+- the mover was not losing (`win_before >= 50`) and the resulting position has
+  a forced mate for the opponent (`walked_into_mate`), or
+- the mover had a forced mate and `win_after < 50` (`dropped_forced_mate`).
+
+### Guard rails
+
+- A forced move is never Blunder, even in a lost position.
+- A book move is never graded on raw cp loss.
+- A normal capture/recapture in an already >90% winning position is not
+  Brilliant.
+- A sacrifice must be a real, legally capturable material loss after the best
+  reply, not merely a tactical offer the engine refutes.
+- A "best move" always gets zero loss, even if the eval drifts between two
+  shallow searches.
+
+## Phases
+
+`phase_for_position(board, ply, last_book_ply)`:
+
+- **endgame**: non-pawn material on both sides is `<= 13` points
+  (N/B/R/Q, values 3/3/5/9). Material wins precedence, so a quick queenless
+  ending is not called "opening".
+- **opening**: otherwise, `ply <= max(20, last_book_ply)`.
+- **middlegame**: everything else.
+
+Phase metrics count non-book, non-forced moves. `endgame` is never assigned
+merely because the game is short.
+
+## Web / bridge contract
+
+The API is versioned separately from the review report:
+
+- Game state `schema_version`: 1
+- Review report `schema_version`: 1, `phase`: 3
+- API metadata `schema_version`: 3
+
+### Review methods
+
+```
+start_game_review(preset="standard", options=None)
+cancel_game_review()
+get_game_review(full=True)
+```
+
+`preset` is `fast`, `standard` or `deep`. Options:
+
+- `depth`: optional integer 6–24 (confirmation is `depth + 2`, capped 18)
+- `use_book`: default true; false grades the opening too (tests/debugging)
+- `force`: default false; true starts a fresh run even if the same line and
+  preset already completed
+
+`start_game_review` returns:
 
 ```json
 {
-  "schema": 1,
-  "engine": { "name": "Stockfish", "version": "17", "depth": 18, "multipv": 3 },
-  "model": { "winprob": "lichess-logistic", "accuracy": "cc-103.1668" },
-  "players": { "white": "Alice", "black": "Bob" },
-  "moves": [
-    {
-      "ply": 1,
-      "san": "e4",
-      "uci": "e2e4",
-      "fen_before": "...",
-      "eval_before": 32,
-      "eval_after": 28,
-      "best_uci": "e2e4",
-      "best_san": "e4",
-      "pv": ["e2e4", "e7e5"],
-      "mate": null,
-      "win_before": 54.2,
-      "win_after": 53.6,
-      "cp_loss": 4,
-      "win_loss": 0.6,
-      "accuracy": 97.4,
-      "classification": "best",
-      "is_book": false,
-      "is_forced": false
-    }
-  ],
-  "summary": {
-    "white": { "accuracy": 88.1, "acpl": 24, "blunders": 1, "mistakes": 2,
-               "inaccuracies": 3, "best": 21, "estimated_elo": 1780 },
-    "black": { "accuracy": 91.4, "acpl": 18, "blunders": 0, "mistakes": 1,
-               "inaccuracies": 2, "best": 24, "estimated_elo": 1920 }
-  },
-  "progress": { "done": 40, "total": 40 }
+  "review": { "status": "queued", "signature": "...", "progress": {...} },
+  "evaluation": {...}
 }
 ```
 
-Frontend rules that follow from this:
+`get_game_review(full=true)` returns:
 
-- Color evals from White POV; flip for the board orientation, not for storage.
-- Use `win_before`/`win_after` for the eval bar, not raw cp.
-- Classification colors must be defined once in the Tailwind theme, not inline.
-- Show `depth` and `multipv` somewhere in the review UI; it manages expectations.
-- A review with `is_forced` moves should visibly skip them in accuracy math.
+```json
+{
+  "review": { "status": "complete", "summary": {...}, "opening": {...} },
+  "report": { "schema_version": 1, "phase": 3, "moves": [...] }
+}
+```
 
-## Caching
+The compact `review` block is also embedded in every game state and engine
+poll, so the frontend can render progress without a second call. Its stable
+fields are:
+
+```
+available, status, signature, run_id, game_id, preset, preset_label,
+depth, confirm_depth, started_at, finished_at, move_count,
+progress, summary, opening, error
+```
+
+On completion it also carries `engine` and `timing`; cancellation may add
+`reason`; the full form adds `report_available` and `report`. There is no
+top-level `multipv` (read `engine.multipv`) and the compact block never includes
+the move list. That is the point of the separate full request.
+
+Status values: `idle`, `queued`, `running`, `complete`, `cancelled`, `failed`.
+On `complete`, the full report is available through `get_game_review`.
+
+### Full report shape
+
+```json
+{
+  "available": true,
+  "schema_version": 1,
+  "phase": 3,
+  "status": "complete",
+  "game_id": "...",
+  "signature": "...",
+  "preset": "standard",
+  "preset_label": "Standard",
+  "engine": {
+    "name": "Stockfish",
+    "version": "17",
+    "depth": 14,
+    "confirm_depth": 16,
+    "multipv": 3
+  },
+  "model": {
+    "winprob": "lichess-logistic",
+    "winprob_version": 2,
+    "accuracy": "cc-103.1668",
+    "accuracy_review": "cc-103.1668100711649+1",
+    "eval_clamp_cp": 1500,
+    "review_clamp_cp": 1000,
+    "initial_cp": 15,
+    "initial_win_prob_white": 51.3828,
+    "mate_cp": 10000,
+    "uncertainty_bonus": 1.0
+  },
+  "players": { "white": "Alice", "black": "Bob" },
+  "result": "1-0",
+  "opening": {
+    "eco": "C50",
+    "name": "Italian Game",
+    "variation": null,
+    "last_book_ply": 5,
+    "source": "eco",
+    "full_name": "Italian Game"
+  },
+  "totals": {
+    "plies": 40,
+    "book_moves": 5,
+    "forced_moves": 1,
+    "graded_moves": 35,
+    "searched_positions": 35,
+    "confirmed_positions": 4,
+    "counts": {
+      "brilliant": 1, "great": 1, "best": 20, "excellent": 5,
+      "good": 4, "book": 5, "inaccuracy": 2, "mistake": 1,
+      "miss": 0, "blunder": 1
+    }
+  },
+  "summary": {
+    "white": {
+      "color": "white",
+      "accuracy": 88.1,
+      "weighted_accuracy": 89.0,
+      "harmonic_accuracy": 87.2,
+      "acpl": 24.0,
+      "acpl_trimmed": 22.5,
+      "moves": 20,
+      "graded_moves": 17,
+      "counted_moves": 16,
+      "scored_moves": 16,
+      "book_moves": 3,
+      "forced_moves": 1,
+      "counts": { "...": 0 },
+      "estimated_elo": {
+        "elo": 1800, "unanchored": 1800, "anchored": null,
+        "baseline": null, "method": "unanchored", "delta_r": null,
+        "components": { "...": 0 }
+      },
+      "phases": {
+        "opening": { "accuracy": 95.0, "acpl": 10.0, "moves": 8 },
+        "middlegame": { "accuracy": 84.0, "acpl": 30.0, "moves": 8 },
+        "endgame": { "accuracy": null, "acpl": null, "moves": 0 }
+      },
+      "blunder_rate": 0.0,
+      "mistake_rate": 0.0
+    },
+    "black": { "...": "same shape" },
+    "accuracy": { "white": 88.1, "black": 84.2 },
+    "acpl": { "white": 24.0, "black": 31.0 },
+    "acpl_trimmed": { "white": 22.5, "black": 29.0 },
+    "estimated_elo": { "white": 1800, "black": 1600 },
+    "counts": { "...": 0 }
+  },
+  "progress": { "done": 40, "total": 40, "phase": "complete", "percent": 100.0 },
+  "timing": {
+    "started_at": "2026-10-21T00:00:00.000Z",
+    "finished_at": "2026-10-21T00:00:05.000Z",
+    "elapsed_ms": 5000,
+    "search_time_ms": 4200,
+    "searches": 36,
+    "cache_hits": 0,
+    "terminal_positions": 1,
+    "avg_search_ms": 116.7
+  },
+  "moves": []
+}
+```
+
+### Move record
+
+Each move has:
+
+```
+ply, move_number, color, san, uci, from, to, fen_before, fen_after,
+is_book, is_forced, legal_moves, phase, opening_eco, opening_name,
+eval_before, eval_after, win_before_white, win_after_white,
+win_before, win_after, mate_before, mate_after,
+best_uci, best_san, best_eval, pv, multi_pv, depth,
+cp_loss, win_loss, accuracy,
+classification, symbol, label, explanation,
+sacrifice_info, brilliant_gates, multi_pv_cliff,
+played_rank, needs_confirmation, confirmed
+```
+
+Book moves keep `classification: "book"`, `is_book: true`, null eval fields,
+`cp_loss: null`, `win_loss: null`, `accuracy: null`. Forced moves keep
+`is_forced: true` and classification `best`; their accuracy/ACPL values still
+exist on the record but aggregation excludes them.
+
+`multi_pv` entries expose `rank`, `uci`, `san`, `win_prob_white`,
+`score_cp`, and `mate`. `pv` is the best line's UCI list.
+
+## Caching and invalidation
 
 Key: `sha256(fen + depth + multipv + engine_version + model_version)`.
-Store `{best_cp, best_uci, pv, played_cp, wdl}`. Cache per position, not per
-PGN, so transpositions and repeated reviews are cheap. Invalidate the whole
-cache when the Stockfish binary or classification thresholds change.
+Store `{best_cp, best_uci, pv, played_cp, wdl, depth}`. A lookup for depth
+`D` may return a cached result with depth `>= D`; it must **never** return a
+shallower result.
+
+Review identity is a signature over `(game_id, start_fen, move_ucis)`.
+Navigation inside the game does **not** invalidate or cancel the review.
+Adding/removing a move, loading a new PGN/FEN, resetting, or starting a bot
+turn does invalidate it. Cancellation uses a dedicated event plus
+`engine.stop()` and a run id; stale worker callbacks are ignored.
 
 ## Failure modes to guard against
 
-- **Sign errors**: grading Black with White POV cp turns every good Black move
-  into a blunder. Assert `cp_loss >= 0` and test both colors.
+- **Sign errors**: grading Black with White POV cp turns good Black moves into
+  blunders. The cp delta is negated for Black; test both colors.
+- **Best move drift**: never charge the engine's own #1 move a loss; set
+  `cp_loss = 0` and `win_loss = 0`.
 - **Engine not ready**: `analyse` before `isready` can hang. Always handshake.
 - **Stale search**: after `stop`, discard `info` lines from the cancelled job;
-  tag each job with an id and ignore mismatches.
-- **Dead engine**: a crashed Stockfish returns no `bestmove`. Timeout the job,
-  restart the process, and surface a retryable error to the UI.
-- **Mate conversion**: `mate 0` and `mate -0` are not "no mate"; handle them.
-- **Missing MultiPV**: grading a played move that is outside the PV needs its
-  own search or a higher MultiPV. Do not reuse the best line's eval for the
-  played move.
-- **Book detection**: do not treat "first 10 plies" as book; use a real opening
-  book or an ECO/PGN database.
-- **Depth drift**: a cache from depth 12 must never be mixed into a depth 18
-  review.
+  tag each job with a run id and ignore mismatches.
+- **Dead engine**: a crashed Stockfish returns no `bestmove`. Timeout, restart,
+  and surface a retryable error to the UI.
+- **Mate conversion**: `mate 0` and `mate -0` are not "no mate"; handle 0.
+- **Missing MultiPV**: grading a played move outside the PV needs its own
+  search or MultiPV 3. Never reuse the best line's eval for the played move.
+- **Book detection**: do not treat "first 10 plies" as book; use the bundled
+  ECO trie (3,865 lines, all 500 ECO codes) and optional Polyglot extension.
+- **Depth drift**: a cache from depth 10 may be used for depth 10 or shallower,
+  never for a deeper request. Pass 2 must request the higher depth explicitly.
+- **Formula drift**: the review curve and the legacy curve are different. Do
+  not edit one to match the other without versioning the model.
+- **Book-only game**: no engine searches, `accuracy: null`, `acpl: 0`, and a
+  complete progress block at 100%.
 
 ## Testing checklist
 
-- Unit-test win% at `cp = 0, ±100, ±400, ±1000`, and mates ±1, ±5.
-- Unit-test accuracy at `loss_win = 0, 10, 20, 30` against the curve table.
-- Property: `cp_loss >= 0`, `0 <= accuracy <= 100` for 10k random inputs.
-- Symmetry: a position and its color-flipped twin produce identical accuracy
+- Win% at `cp = 0, ±100, ±400, ±1000`; review clamp at ±1000; mate ±1, ±5.
+- Initial prior exactly `review_win_probability(15)` on the standard start.
+- Review accuracy at `loss_win = 0, 10, 20, 30` against the exact constants;
+  legacy accuracy remains frozen at the rounded constants.
+- Property: `cp_loss >= 0`, `0 <= accuracy <= 100` for random inputs.
+- Symmetry: a position and its colour-flipped twin produce identical accuracy
   after POV conversion.
-- Fixture PGNs: one clean game (~95%), one blunderfest (~60%), one forced-move
-  game (100% or excluded), one book-only game.
-- Golden test the full payload for a 20-move game; review diffs by hand when a
-  formula changes.
-- Cross-check 5 positions against the Stockfish CLI or a second engine build.
+- Volatility window `L = clamp(floor(N/10), 2, 8)`, boundary padding, population
+  standard deviation, clamp `[0.5, 12]`.
+- Accuracy blend equals the 50/50 weighted/harmonic formula.
+- ACPL trim only at 8+ moves; forced and book excluded.
+- Estimated Elo unanchored, anchored, rounded and clamped.
+- All ten labels at their boundaries; forced rolls into best and is marked.
+- Brilliant gates: each gate can reject; pass-1 pending and pass-2 confirmed.
+- Great: cliff >= 10, non-trivial capture, pass-2 confirmed.
+- Miss: previous error + held position + missed mate.
+- Blunder overrides: walked into mate, dropped forced mate.
+- Two-pass pipeline: base depth, MultiPV 3, confirm positions `{ply-1, ply}`,
+  confirm depth +2, up to 3 rounds, pass 2 can downgrade.
+- Terminal checkmate/draw positions do not search.
+- Cancellation stops before the next search and never completes a report.
+- Book-only game: zero searches, book records, null accuracy.
+- Signature invalidation on move change; navigation does not cancel.
+- Golden payload keys for a 4-ply game, including `cp_loss`, `win_loss`,
+  `accuracy`, `classification`, `confirmed`, totals and timing.
+- Full pytest suite and `python -m chess_master --smoke-test`.
 
 ## References
 
 - Stockfish UCI docs: <https://official-stockfish.github.io/docs/stockfish-wiki/UCI-chess-engine.html>
 - python-chess engine API: <https://python-chess.readthedocs.io/en/latest/engine.html>
 - Lichess win% model: <https://github.com/lichess-org/lila>
+- Lichess accuracy model: `AccuracyPercent.scala`, PR #11148
 - Chess.com accuracy discussion (community reverse engineering): search
   "chess.com accuracy formula 103.1668"
 - Chess.com Game Review announcement: <https://www.chess.com/news/view/game-review>
+- Bundled openings: `lichess-org/chess-openings` (CC0), 3,865 named lines
 
 Update this section with the exact engine build and any calibration datasets
 used, so a future change can be reproduced.

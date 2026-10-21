@@ -497,7 +497,7 @@ class GameSession:
 
         return {
             "schema_version": 1,
-            "phase": 2,
+            "phase": 3,
             "app_version": __version__,
             "game_id": self._game_id,
             "revision": self.revision,
@@ -527,8 +527,12 @@ class GameSession:
             "evaluation": self._evaluation_placeholder(),
             "review": {
                 "available": False,
-                "status": "phase_3_placeholder",
-                "winprob_model": "lichess-logistic",
+                "status": "idle",
+                "signature": None,
+                "progress": {"done": 0, "total": 0, "phase": "idle", "percent": 0.0},
+                "summary": None,
+                "opening": None,
+                "error": None,
             },
             "import_meta": dict(self._import_meta) if self._import_meta else None,
         }

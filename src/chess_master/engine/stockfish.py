@@ -32,6 +32,13 @@ from typing import Any, Callable
 import chess
 import chess.engine
 
+from chess_master.analysis.review import (
+    REVIEW_MULTIPV,
+    ReviewCancelled,
+    ReviewRequest,
+    ReviewSearchResult,
+    run_game_review,
+)
 from chess_master.analysis.winprob import (
     MATE_CP,
     WINPROB_VERSION,
@@ -762,6 +769,34 @@ class AnalysisCache:
             self._hits += 1
             return copy.deepcopy(payload)
 
+    def get_at_least(self, fen: str, depth: int, multipv: int = 1) -> dict[str, Any] | None:
+        """Return the shallowest cached search that is at least this deep.
+
+        Live analysis reuses deeper results; a review never accepts a shallower
+        entry than the depth it asked for, which keeps a depth-10 cache from
+        leaking into a depth-14 review.
+        """
+
+        normalized = normalize_fen(fen)
+        wanted_depth = int(depth)
+        wanted_multipv = int(multipv)
+        with self._lock:
+            candidates = [
+                key[1]
+                for key, payload in self._data.items()
+                if key[0] == normalized
+                and key[1] >= wanted_depth
+                and int(payload.get("multipv", 0)) >= wanted_multipv
+            ]
+            if not candidates:
+                self._misses += 1
+                return None
+            key = (normalized, min(candidates))
+            payload = self._data[key]
+            self._data.move_to_end(key)
+            self._hits += 1
+            return copy.deepcopy(payload)
+
     def put(self, fen: str, depth: int, payload: Mapping[str, Any]) -> None:
         key = (normalize_fen(fen), int(depth))
         with self._lock:
@@ -801,6 +836,7 @@ class EngineJob:
     nodes: int | None = None
     elo: int = DEFAULT_ELO
     use_cache: bool = True
+    review: ReviewRequest | None = None
     seq: int = 0
 
 
@@ -817,6 +853,8 @@ class StockfishManager:
         project_root: Path | None = None,
         on_analysis: Callable[[EngineToken, dict[str, Any]], None] | None = None,
         on_bot_move: Callable[[EngineToken, str, dict[str, Any]], None] | None = None,
+        on_review_progress: Callable[[dict[str, Any]], None] | None = None,
+        on_review_complete: Callable[[dict[str, Any]], None] | None = None,
         on_error: Callable[[str], None] | None = None,
         engine_factory: EngineFactory | None = None,
         cache: AnalysisCache | None = None,
@@ -827,6 +865,8 @@ class StockfishManager:
         self._cache = cache or AnalysisCache()
         self._on_analysis = on_analysis
         self._on_bot_move = on_bot_move
+        self._on_review_progress = on_review_progress
+        self._on_review_complete = on_review_complete
         self._on_error = on_error
         self._engine_factory = engine_factory
 
@@ -837,6 +877,8 @@ class StockfishManager:
         self._active_token: EngineToken | None = None
         self._current_job: EngineJob | None = None
         self._current_analysis: Any = None
+        self._review_cancel = threading.Event()
+        self._last_review_run_id: int | None = None
         self._thread: threading.Thread | None = None
         self._start_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -878,15 +920,24 @@ class StockfishManager:
     def cache(self) -> AnalysisCache:
         return self._cache
 
+    @property
+    def review_run_id(self) -> int | None:
+        with self._lock:
+            return self._last_review_run_id
+
     def set_callbacks(
         self,
         *,
         on_analysis: Callable[[EngineToken, dict[str, Any]], None] | None = None,
         on_bot_move: Callable[[EngineToken, str, dict[str, Any]], None] | None = None,
+        on_review_progress: Callable[[dict[str, Any]], None] | None = None,
+        on_review_complete: Callable[[dict[str, Any]], None] | None = None,
         on_error: Callable[[str], None] | None = None,
     ) -> None:
         self._on_analysis = on_analysis
         self._on_bot_move = on_bot_move
+        self._on_review_progress = on_review_progress
+        self._on_review_complete = on_review_complete
         self._on_error = on_error
 
     # -- lifecycle -------------------------------------------------------
@@ -897,6 +948,7 @@ class StockfishManager:
             if self._thread is not None and self._thread.is_alive():
                 return True
             self._stop_event.clear()
+            self._review_cancel.clear()
             self._thread = threading.Thread(
                 target=self._worker_loop,
                 name="chess-master-stockfish",
@@ -930,6 +982,7 @@ class StockfishManager:
     def stop(self, timeout: float = 2.0) -> None:
         with self._lock:
             self._stop_event.set()
+            self._review_cancel.set()
             self._jobs.clear()
             self._latest_seq.clear()
             analysis = self._current_analysis
@@ -972,11 +1025,13 @@ class StockfishManager:
             self._active_token = token
             if changed:
                 for kind, job in list(self._jobs.items()):
+                    if kind == "review":
+                        continue
                     if job.token != token:
                         self._jobs.pop(kind, None)
                         self._latest_seq.pop(kind, None)
                 current = self._current_job
-                if current is not None and current.token != token:
+                if current is not None and current.kind != "review" and current.token != token:
                     stop_analysis = self._current_analysis
             self._job_ready.notify_all()
         if stop_analysis is not None:
@@ -1045,6 +1100,55 @@ class StockfishManager:
         self._enqueue(job)
         return "queued"
 
+    def submit_review(self, request: ReviewRequest) -> str:
+        """Queue one two-pass game review on the owner thread."""
+
+        if not self.available:
+            return "unavailable"
+        if not isinstance(request, ReviewRequest):
+            raise TypeError("submit_review expects a ReviewRequest")
+        # A second review supersedes the first immediately.
+        self.cancel_review()
+        with self._lock:
+            self._review_cancel.clear()
+        token = EngineToken(request.game_id, 0, 0, request.start_fen)
+        job = self._make_job(
+            "review",
+            token,
+            start_fen=request.start_fen,
+            moves=tuple(request.moves),
+            depth=request.base_depth,
+            multipv=REVIEW_MULTIPV,
+            use_cache=True,
+            review=request,
+        )
+        with self._lock:
+            self._last_review_run_id = job.seq
+        self._enqueue(job)
+        return "queued"
+
+    def cancel_review(self) -> bool:
+        """Cancel a queued or running review without touching other jobs."""
+
+        analysis = None
+        cancelled = False
+        with self._lock:
+            queued = self._jobs.pop("review", None) is not None
+            running = self._current_job is not None and self._current_job.kind == "review"
+            if queued or running:
+                self._review_cancel.set()
+                cancelled = True
+            self._latest_seq.pop("review", None)
+            if running:
+                analysis = self._current_analysis
+            self._job_ready.notify_all()
+        if analysis is not None:
+            try:
+                analysis.stop()
+            except Exception:  # pragma: no cover - engine may already be gone
+                logger.debug("Could not stop a reviewed search", exc_info=True)
+        return cancelled
+
     def _make_job(self, kind: str, token: EngineToken, **kwargs: Any) -> EngineJob:
         with self._lock:
             self._seq += 1
@@ -1066,7 +1170,13 @@ class StockfishManager:
                         self._job_ready.wait(0.5)
                     if self._stop_event.is_set():
                         break
-                    kind = "bot" if "bot" in self._jobs else next(iter(self._jobs))
+                    kind = (
+                        "bot"
+                        if "bot" in self._jobs
+                        else "review"
+                        if "review" in self._jobs
+                        else next(iter(self._jobs))
+                    )
                     job = self._jobs.pop(kind)
                     self._current_job = job
                     self._job_ready.notify_all()
@@ -1079,6 +1189,8 @@ class StockfishManager:
                         continue
                     if job.kind == "analysis":
                         self._run_analysis(engine, job)
+                    elif job.kind == "review":
+                        self._run_review(engine, job)
                     else:
                         self._run_bot(engine, job)
                 except Exception as exc:  # engine crash / bad position
@@ -1162,9 +1274,17 @@ class StockfishManager:
 
     def _job_is_current(self, job: EngineJob) -> bool:
         with self._lock:
+            if self._stop_event.is_set():
+                return False
+            if job.kind == "review":
+                # A review belongs to the game line, not to the current view:
+                # navigating through history must never cancel it.
+                return (
+                    not self._review_cancel.is_set()
+                    and self._latest_seq.get("review") == job.seq
+                )
             return (
-                not self._stop_event.is_set()
-                and self._active_token == job.token
+                self._active_token == job.token
                 and self._latest_seq.get(job.kind) == job.seq
             )
 
@@ -1188,19 +1308,29 @@ class StockfishManager:
             options["UCI_ShowWDL"] = True
         engine.configure(options)
 
-    def _search(self, engine: Any, job: EngineJob, board: chess.Board) -> list[dict[str, Any]] | None:
+    def _search_position(
+        self,
+        engine: Any,
+        board: chess.Board,
+        *,
+        depth: int,
+        multipv: int,
+        movetime: float | None = None,
+        nodes: int | None = None,
+        is_current: Callable[[], bool],
+    ) -> list[dict[str, Any]] | None:
         limit = chess.engine.Limit(
-            depth=max(1, int(job.depth)),
-            time=job.movetime,
-            nodes=job.nodes,
+            depth=max(1, int(depth)),
+            time=movetime,
+            nodes=nodes,
         )
         cancelled = False
-        with engine.analysis(board, limit, multipv=max(1, int(job.multipv))) as analysis:
+        with engine.analysis(board, limit, multipv=max(1, int(multipv))) as analysis:
             with self._lock:
                 self._current_analysis = analysis
             try:
                 for _info in analysis:
-                    if not self._job_is_current(job):
+                    if not is_current():
                         cancelled = True
                         analysis.stop()
                         break
@@ -1209,9 +1339,20 @@ class StockfishManager:
                     if self._current_analysis is analysis:
                         self._current_analysis = None
             infos = [] if cancelled else [dict(info) for info in analysis.multipv]
-        if cancelled or not self._job_is_current(job):
+        if cancelled or not is_current():
             return None
         return infos
+
+    def _search(self, engine: Any, job: EngineJob, board: chess.Board) -> list[dict[str, Any]] | None:
+        return self._search_position(
+            engine,
+            board,
+            depth=job.depth,
+            multipv=job.multipv,
+            movetime=job.movetime,
+            nodes=job.nodes,
+            is_current=lambda: self._job_is_current(job),
+        )
 
     def _run_analysis(self, engine: Any, job: EngineJob) -> None:
         board = self._build_board(job)
@@ -1299,6 +1440,105 @@ class StockfishManager:
                 return pv[0]
         return None
 
+    # -- game review -----------------------------------------------------
+    def _configure_review(self, engine: Any, multipv: int) -> None:
+        options: dict[str, Any] = {
+            "Threads": WORKER_THREADS,
+            "Hash": WORKER_HASH_MB,
+            "UCI_LimitStrength": False,
+            "Skill Level": 20,
+        }
+        if "UCI_ShowWDL" in getattr(engine, "options", {}):
+            options["UCI_ShowWDL"] = True
+        engine.configure(options)
+
+    def _review_search(self, engine: Any, job: EngineJob) -> Any:
+        def search(board: chess.Board, depth: int, multipv: int) -> ReviewSearchResult | None:
+            cached = self._cache.get_at_least(board.fen(), depth, multipv)
+            if cached is not None:
+                return ReviewSearchResult(
+                    lines=list(cached.get("lines") or []),
+                    depth=int(cached.get("depth") or depth),
+                    multipv=int(cached.get("multipv") or multipv),
+                    cached=True,
+                    nodes=int(cached.get("nodes") or 0),
+                    time_ms=int(cached.get("time_ms") or 0),
+                )
+            if not self._job_is_current(job):
+                return None
+            self._configure_review(engine, multipv)
+            infos = self._search_position(
+                engine,
+                board,
+                depth=depth,
+                multipv=multipv,
+                is_current=lambda: self._job_is_current(job),
+            )
+            if infos is None:
+                return None
+            payload = analysis_payload_from_infos(
+                board,
+                infos,
+                engine_name=self.name,
+                engine_version=self.version,
+            )
+            if payload is None:
+                return None
+            self._cache.put(board.fen(), depth, payload)
+            return ReviewSearchResult(
+                lines=list(payload["lines"]),
+                depth=int(payload["depth"]),
+                multipv=int(payload["multipv"]),
+                nodes=int(payload["nodes"]),
+                time_ms=int(payload["time_ms"]),
+            )
+
+        return search
+
+    def _run_review(self, engine: Any, job: EngineJob) -> None:
+        request = job.review
+        if request is None:
+            return
+        run_id = job.seq
+        base = {
+            "run_id": run_id,
+            "game_id": request.game_id,
+            "signature": request.signature,
+            "preset": request.preset,
+        }
+
+        def progress(payload: dict[str, Any]) -> None:
+            if not self._job_is_current(job):
+                return
+            self._emit_review_progress({**base, **payload, "status": "running"})
+
+        try:
+            report = run_game_review(
+                request,
+                self._review_search(engine, job),
+                should_cancel=lambda: not self._job_is_current(job),
+                on_progress=progress,
+                engine_name=self.name,
+                engine_version=self.version,
+            )
+        except ReviewCancelled:
+            self._emit_review_complete({**base, "available": True, "status": "cancelled"})
+            return
+        except chess.engine.EngineError:
+            raise
+        except Exception as exc:  # malformed line / engine failure inside a search
+            logger.exception("Game review failed")
+            self._emit_review_complete(
+                {**base, "available": False, "status": "failed", "error": str(exc)}
+            )
+            return
+
+        if not self._job_is_current(job):
+            self._emit_review_complete({**base, "available": True, "status": "cancelled"})
+            return
+        report["run_id"] = run_id
+        self._emit_review_complete(report)
+
     # -- payloads --------------------------------------------------------
     def _decorate(self, payload: Mapping[str, Any], token: EngineToken) -> dict[str, Any]:
         decorated = copy.deepcopy(dict(payload))
@@ -1339,6 +1579,24 @@ class StockfishManager:
             callback(message)
         except Exception:  # pragma: no cover - callback isolation
             logger.exception("Engine error callback failed")
+
+    def _emit_review_progress(self, payload: dict[str, Any]) -> None:
+        callback = self._on_review_progress
+        if callback is None:
+            return
+        try:
+            callback(copy.deepcopy(payload))
+        except Exception:  # pragma: no cover - callback isolation
+            logger.exception("Review progress callback failed")
+
+    def _emit_review_complete(self, payload: dict[str, Any]) -> None:
+        callback = self._on_review_complete
+        if callback is None:
+            return
+        try:
+            callback(copy.deepcopy(payload))
+        except Exception:  # pragma: no cover - callback isolation
+            logger.exception("Review completion callback failed")
 
     def status_payload(self) -> dict[str, Any]:
         with self._lock:

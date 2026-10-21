@@ -14,11 +14,18 @@ from __future__ import annotations
 import copy
 import logging
 import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 import chess
 
+from chess_master.analysis.review import (
+    REVIEW_PRESETS,
+    ReviewRequest,
+    line_signature,
+)
 from chess_master.analysis.winprob import WINPROB_VERSION
 from chess_master.engine.stockfish import (
     DEFAULT_DEPTH,
@@ -38,6 +45,10 @@ __all__ = ["EngineCoordinator"]
 logger = logging.getLogger(__name__)
 
 
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 class EngineCoordinator:
     """Per-table engine policy and stale-result guard."""
 
@@ -53,6 +64,8 @@ class EngineCoordinator:
         self._worker.set_callbacks(
             on_analysis=self._on_analysis,
             on_bot_move=self._on_bot_move,
+            on_review_progress=self._on_review_progress,
+            on_review_complete=self._on_review_complete,
             on_error=self._on_error,
         )
         self._token: EngineToken | None = None
@@ -62,6 +75,10 @@ class EngineCoordinator:
         self._analysis_scheduled: EngineToken | None = None
         self._thinking = False
         self._last_error: str | None = None
+        self._review: dict[str, Any] | None = None
+        self._review_report: dict[str, Any] | None = None
+        self._review_signature: str | None = None
+        self._review_run_id: int | None = None
         self._options = {
             "enabled": True,
             "arrows": False,
@@ -100,6 +117,7 @@ class EngineCoordinator:
     def bind(self, session: "GameSession") -> EngineToken:
         token = self.token_for(session)
         with self._lock:
+            self._reset_review()
             self._reset_for(token)
         self._worker.set_active_token(token)
         return token
@@ -116,6 +134,7 @@ class EngineCoordinator:
         """Re-point the engine at the session's current revision and schedule."""
 
         token = self.token_for(session)
+        self._invalidate_review_if_needed(session)
         with self._lock:
             old_depth = int(self._options["depth"])
             old_multipv = int(self._options["multipv"])
@@ -140,6 +159,13 @@ class EngineCoordinator:
             if token != self._token:
                 self._reset_for(token)
         self._worker.set_active_token(token)
+        if self._review_is_running():
+            if self._is_bot_turn(session):
+                # The bot must keep playing; a review is a background task.
+                self.cancel_game_review(session, reason="bot_turn")
+            else:
+                # Live analysis would queue behind a multi-minute review.
+                return
         self.ensure_scheduled(session)
 
     def ensure_scheduled(self, session: "GameSession") -> None:
@@ -333,9 +359,294 @@ class EngineCoordinator:
     def cache_stats(self) -> dict[str, Any]:
         return self._worker.cache.stats()
 
+    # -- game review -----------------------------------------------------
+    def start_game_review(
+        self,
+        session: "GameSession",
+        *,
+        preset: str = "standard",
+        depth: int | None = None,
+        force: bool = False,
+        use_book: bool = True,
+    ) -> dict[str, Any]:
+        """Start (or resume) a two-pass review for the current game line."""
+
+        signature = line_signature(session.game_id, session.start_fen, session.move_ucis())
+        requested_depth = int(depth) if depth is not None else int(REVIEW_PRESETS[preset]["depth"])
+        with self._lock:
+            if (
+                not force
+                and self._review is not None
+                and self._review_signature == signature
+                and self._review.get("preset") == preset
+                and int(self._review.get("depth") or 0) == requested_depth
+                and self._review.get("status") in {"queued", "running", "complete"}
+            ):
+                return self.review_payload(full=False)
+
+        state = session.to_state()
+        players = state.get("players") or {}
+        white_name = str((players.get("white") or {}).get("name") or "White")
+        black_name = str((players.get("black") or {}).get("name") or "Black")
+        result = str((state.get("status") or {}).get("result") or "*")
+        baseline_white = None
+        baseline_black = None
+        bot_elo = session.engine_bot_elo
+        if session.mode == "stockfish" and bot_elo:
+            if session.engine_bot_color == "white":
+                baseline_white = int(bot_elo)
+            elif session.engine_bot_color == "black":
+                baseline_black = int(bot_elo)
+
+        request = ReviewRequest(
+            game_id=session.game_id,
+            start_fen=session.start_fen,
+            moves=tuple(session.move_ucis()),
+            preset=preset,
+            depth=depth,
+            white_name=white_name,
+            black_name=black_name,
+            result=result,
+            baseline_white=baseline_white,
+            baseline_black=baseline_black,
+            use_book=bool(use_book),
+        )
+
+        self._worker.cancel_review()
+        with self._lock:
+            self._reset_review()
+            self._review_signature = signature
+            self._review = {
+                "available": True,
+                "status": "queued",
+                "signature": signature,
+                "game_id": session.game_id,
+                "preset": preset,
+                "preset_label": REVIEW_PRESETS[preset]["label"],
+                "depth": request.base_depth,
+                "confirm_depth": request.confirm_depth,
+                "started_at": _utc_now(),
+                "finished_at": None,
+                "progress": {
+                    "done": 0,
+                    "total": len(request.moves) + 1,
+                    "phase": "queued",
+                    "percent": 0.0,
+                },
+                "summary": None,
+                "opening": None,
+                "error": None,
+                "move_count": len(request.moves),
+            }
+
+        status = self._worker.submit_review(request)
+        run_id = self._worker.review_run_id
+        with self._lock:
+            if self._review is None:
+                return self.review_payload()
+            self._review_run_id = run_id
+            self._review["run_id"] = run_id
+            if status == "unavailable":
+                self._review.update(
+                    {
+                        "available": False,
+                        "status": "failed",
+                        "finished_at": _utc_now(),
+                        "error": "Stockfish is not available.",
+                        "progress": {
+                            "done": 0,
+                            "total": self._review["progress"]["total"],
+                            "phase": "failed",
+                            "percent": 0.0,
+                        },
+                    }
+                )
+        return self.review_payload(full=False)
+
+    def cancel_game_review(
+        self, session: "GameSession | None" = None, *, reason: str = "cancelled"
+    ) -> dict[str, Any]:
+        """Cancel the active review.  Navigation alone never calls this."""
+
+        if session is not None:
+            signature = line_signature(session.game_id, session.start_fen, session.move_ucis())
+        else:
+            signature = self._review_signature
+        self._worker.cancel_review()
+        with self._lock:
+            if (
+                self._review is not None
+                and self._review_signature == signature
+                and self._review.get("status") in {"queued", "running"}
+            ):
+                self._review.update(
+                    {
+                        "status": "cancelled",
+                        "finished_at": _utc_now(),
+                        "error": None,
+                        "progress": {
+                            **self._review.get("progress", {}),
+                            "phase": "cancelled",
+                        },
+                    }
+                )
+                self._review["progress"]["percent"] = float(
+                    self._review["progress"].get("percent") or 0.0
+                )
+            return self.review_payload(full=False, reason=reason)
+
+    def review_payload(self, *, full: bool = False, reason: str | None = None) -> dict[str, Any]:
+        """Compact review block for state/poll, or the full report on demand."""
+
+        with self._lock:
+            snapshot = copy.deepcopy(self._review)
+            report = copy.deepcopy(self._review_report) if full else None
+            signature = self._review_signature
+            run_id = self._review_run_id
+        if snapshot is None:
+            return {
+                "available": False,
+                "status": "idle",
+                "signature": signature,
+                "run_id": run_id,
+                "progress": {"done": 0, "total": 0, "phase": "idle", "percent": 0.0},
+                "summary": None,
+                "opening": None,
+                "error": None,
+                "reason": reason,
+            }
+        snapshot["run_id"] = run_id
+        if reason:
+            snapshot["reason"] = reason
+        if report is not None:
+            snapshot["report_available"] = True
+            if full:
+                snapshot["report"] = report
+                snapshot["moves"] = report.get("moves", [])
+                snapshot["summary"] = report.get("summary")
+                snapshot["opening"] = report.get("opening")
+                snapshot["engine"] = report.get("engine")
+                snapshot["model"] = report.get("model")
+                snapshot["timing"] = report.get("timing")
+                snapshot["progress"] = report.get("progress")
+        elif full:
+            snapshot["report_available"] = False
+        return snapshot
+
+    def game_review(self, *, full: bool = False) -> dict[str, Any]:
+        return self.review_payload(full=full)
+
+    def _review_is_running(self) -> bool:
+        with self._lock:
+            return bool(
+                self._review is not None
+                and self._review.get("status") in {"queued", "running"}
+            )
+
+    def _review_matches(self, payload: Mapping[str, Any]) -> bool:
+        signature = payload.get("signature")
+        run_id = payload.get("run_id")
+        if signature != self._review_signature:
+            return False
+        if self._review_run_id is not None and run_id is not None:
+            return int(run_id) == int(self._review_run_id)
+        return True
+
+    def _invalidate_review_if_needed(self, session: "GameSession") -> None:
+        if self._review is None:
+            return
+        signature = line_signature(session.game_id, session.start_fen, session.move_ucis())
+        if signature == self._review_signature:
+            return
+        self._worker.cancel_review()
+        with self._lock:
+            if signature != self._review_signature:
+                self._reset_review()
+
+    def _reset_review(self) -> None:
+        self._review = None
+        self._review_report = None
+        self._review_signature = None
+        self._review_run_id = None
+
+    def _apply_review_progress(self, payload: Mapping[str, Any]) -> None:
+        with self._lock:
+            if self._review is None or not self._review_matches(payload):
+                return
+            if self._review_run_id is None and payload.get("run_id") is not None:
+                self._review_run_id = int(payload["run_id"])
+            self._review["status"] = "running"
+            self._review["run_id"] = payload.get("run_id")
+            self._review["progress"] = {
+                "done": int(payload.get("done") or 0),
+                "total": int(payload.get("total") or 0),
+                "phase": str(payload.get("phase") or "scan"),
+                "percent": float(payload.get("percent") or 0.0),
+            }
+
+    def _apply_review_complete(self, payload: Mapping[str, Any]) -> None:
+        with self._lock:
+            if self._review is None or not self._review_matches(payload):
+                return
+            status = str(payload.get("status") or "failed")
+            if status == "complete":
+                self._review_report = copy.deepcopy(dict(payload))
+                summary = payload.get("summary") or {}
+                self._review.update(
+                    {
+                        "available": True,
+                        "status": "complete",
+                        "finished_at": (payload.get("timing") or {}).get("finished_at")
+                        or _utc_now(),
+                        "summary": {
+                            "accuracy": summary.get("accuracy"),
+                            "acpl": summary.get("acpl"),
+                            "acpl_trimmed": summary.get("acpl_trimmed"),
+                            "estimated_elo": summary.get("estimated_elo"),
+                            "counts": summary.get("counts"),
+                        },
+                        "opening": payload.get("opening"),
+                        "engine": payload.get("engine"),
+                        "timing": payload.get("timing"),
+                        "progress": payload.get("progress")
+                        or {
+                            "done": int(payload.get("progress", {}).get("done") or 0),
+                            "total": int(payload.get("progress", {}).get("total") or 0),
+                            "phase": "complete",
+                            "percent": 100.0,
+                        },
+                        "error": None,
+                    }
+                )
+            elif status == "cancelled":
+                self._review.update(
+                    {
+                        "status": "cancelled",
+                        "finished_at": _utc_now(),
+                        "progress": {
+                            **self._review.get("progress", {}),
+                            "phase": "cancelled",
+                        },
+                    }
+                )
+            else:
+                self._review.update(
+                    {
+                        "status": "failed",
+                        "available": bool(payload.get("available", True)),
+                        "finished_at": _utc_now(),
+                        "error": str(payload.get("error") or "The review failed."),
+                        "progress": {
+                            **self._review.get("progress", {}),
+                            "phase": "failed",
+                        },
+                    }
+                )
+
     # -- configuration ---------------------------------------------------
     def configure_path(self, path: str | Path | None) -> dict[str, Any]:
         with self._lock:
+            self._reset_review()
             self._analysis = None
             self._pending_bot = None
             self._bot_scheduled = None
@@ -352,6 +663,9 @@ class EngineCoordinator:
         with self._lock:
             self._analysis = None
             self._pending_bot = None
+            self._review = None
+            self._review_report = None
+        self._worker.cancel_review()
         self._worker.stop()
 
     # -- worker callbacks ------------------------------------------------
@@ -379,6 +693,24 @@ class EngineCoordinator:
         with self._lock:
             self._last_error = message
             self._thinking = False
+            if self._review is not None and self._review.get("status") in {"queued", "running"}:
+                self._review.update(
+                    {
+                        "status": "failed",
+                        "finished_at": _utc_now(),
+                        "error": message,
+                        "progress": {
+                            **self._review.get("progress", {}),
+                            "phase": "failed",
+                        },
+                    }
+                )
+
+    def _on_review_progress(self, payload: dict[str, Any]) -> None:
+        self._apply_review_progress(payload)
+
+    def _on_review_complete(self, payload: dict[str, Any]) -> None:
+        self._apply_review_complete(payload)
 
     # -- internals -------------------------------------------------------
     def _reset_for(self, token: EngineToken) -> None:

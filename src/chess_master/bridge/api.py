@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from chess_master import __version__
+from chess_master.analysis.review import REVIEW_PRESETS
 from chess_master.analysis.winprob import model_info
 from chess_master.engine.coordinator import EngineCoordinator
 from chess_master.engine.errors import ChessMasterError, InvalidInputError
@@ -55,7 +56,7 @@ _ANALYSIS_DEFAULTS = {
 class ChessMasterApi:
     """The object exposed to JavaScript as ``window.pywebview.api``."""
 
-    PHASE = 2
+    PHASE = 3
 
     def __init__(
         self,
@@ -122,6 +123,7 @@ class ChessMasterApi:
         state["evaluation"] = self._engine.evaluation(self._session)
         state["evaluation"]["bars"] = bool(self._analysis_options["enabled"])
         state["evaluation"]["arrows"] = bool(self._analysis_options["arrows"])
+        state["review"] = self._engine.game_review()
         return state
 
     def _bind_session(self, session: GameSession) -> None:
@@ -239,6 +241,7 @@ class ChessMasterApi:
                 "thinking": bool(state["engine"]["thinking"]),
                 "evaluation": state["evaluation"],
                 "engine": state["engine"],
+                "review": state["review"],
             }
 
         return self._execute(operation)
@@ -327,6 +330,81 @@ class ChessMasterApi:
 
         return self._execute(operation)
 
+    # -- game review -----------------------------------------------------
+    def start_game_review(
+        self,
+        preset: str = "standard",
+        options: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Start a two-pass Stockfish review of the current game line.
+
+        ``preset`` is ``fast`` (depth 10), ``standard`` (14) or ``deep`` (16).
+        Pass 2 confirms Brilliant/Great candidates at ``depth + 2`` (cap 18).
+        """
+
+        def operation() -> dict[str, Any]:
+            if not isinstance(preset, str) or preset.strip().lower() not in REVIEW_PRESETS:
+                raise InvalidInputError(
+                    "Choose a review preset: fast, standard or deep.",
+                    details={"preset": preset, "valid": list(REVIEW_PRESETS)},
+                )
+            if not isinstance(options, Mapping) and options is not None:
+                raise InvalidInputError("Review options must be an object.")
+            incoming = options or {}
+            depth = incoming.get("depth")
+            if depth is not None:
+                if isinstance(depth, bool):
+                    raise InvalidInputError("Review depth must be a whole number.")
+                try:
+                    depth = int(depth)
+                except (TypeError, ValueError) as exc:
+                    raise InvalidInputError("Review depth must be a whole number.") from exc
+                if depth < 6 or depth > 24:
+                    raise InvalidInputError("Review depth must be from 6 to 24.")
+            force = bool(incoming.get("force", False))
+            use_book = incoming.get("use_book", True)
+            if not isinstance(use_book, bool):
+                raise InvalidInputError("Review use_book must be true or false.")
+            if self._session.total_plies <= 0:
+                raise InvalidInputError(
+                    "Play or import at least one move before running a review."
+                )
+            review = self._engine.start_game_review(
+                self._session,
+                preset=preset.strip().lower(),
+                depth=depth,
+                force=force,
+                use_book=use_book,
+            )
+            return {"review": review, "evaluation": self._engine.evaluation(self._session)}
+
+        return self._execute(operation)
+
+    def cancel_game_review(self) -> dict[str, Any]:
+        """Stop the running review; the game and live analysis are untouched."""
+
+        def operation() -> dict[str, Any]:
+            review = self._engine.cancel_game_review(self._session, reason="user")
+            self._sync_engine()
+            return {"review": review}
+
+        return self._execute(operation)
+
+    def get_game_review(self, full: bool = True) -> dict[str, Any]:
+        """Return the compact review block and, when complete, the full report."""
+
+        def operation() -> dict[str, Any]:
+            payload = self._engine.game_review(full=True)
+            report = payload.get("report") if full else None
+            compact = {
+                key: value
+                for key, value in payload.items()
+                if key not in {"report", "moves"}
+            }
+            return {"review": compact, "report": report}
+
+        return self._execute(operation)
+
     # -- metadata --------------------------------------------------------
     def get_api_info(self) -> dict[str, Any]:
         """Describe the bridge, its phase and the approved analysis model."""
@@ -336,7 +414,7 @@ class ChessMasterApi:
                 "name": "Chess Master",
                 "version": __version__,
                 "phase": self.PHASE,
-                "schema_version": 2,
+                "schema_version": 3,
                 "modes": list(VALID_MODES),
                 "methods": [
                     "new_game",
@@ -353,6 +431,9 @@ class ChessMasterApi:
                     "set_analysis_options",
                     "configure_engine_path",
                     "get_engine_status",
+                    "start_game_review",
+                    "cancel_game_review",
+                    "get_game_review",
                 ],
                 "capabilities": {
                     "pass_and_play": True,
@@ -365,7 +446,8 @@ class ChessMasterApi:
                     "best_move_arrows": True,
                     "multi_pv": True,
                     "engine_path_config": True,
-                    "game_review": False,
+                    "game_review": True,
+                    "review_presets": list(REVIEW_PRESETS),
                 },
                 "analysis": model_info(),
                 "engine": self._engine.engine_payload(self._session),

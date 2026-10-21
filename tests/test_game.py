@@ -21,7 +21,7 @@ def test_new_game_state() -> None:
     state = session.to_state()
 
     assert state["schema_version"] == 1
-    assert state["phase"] == 2
+    assert state["phase"] == 3
     assert state["mode"] == "pass_play"
     assert state["mode_label"] == "Pass & Play"
     assert state["players"]["white"]["name"] == "Alice"

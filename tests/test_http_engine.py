@@ -51,10 +51,10 @@ def get_json(url: str) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
-def test_health_reports_phase_two_and_engine(server: WebAppServer) -> None:
+def test_health_reports_phase_three_and_engine(server: WebAppServer) -> None:
     info = get_json(f"{server.url}api/health")
     assert info["ok"] is True
-    assert info["data"]["phase"] == 2
+    assert info["data"]["phase"] == 3
     assert info["data"]["capabilities"]["engine"] is True
     assert info["data"]["engine"]["available"] is True
     assert info["data"]["elo"]["min"] == 400

@@ -5,6 +5,7 @@ import { BoardController } from "./board.js";
 import { ImportPanel } from "./importPanel.js";
 import { renderMoves } from "./moves.js";
 import { renderPlayers } from "./players.js";
+import { ReviewPanel } from "./reviewPanel.js";
 import {
   app,
   canHumanMove,
@@ -46,7 +47,6 @@ const refs = {
   appVersion: $("app-version"),
   stageImport: $("btn-stage-import"),
   newGameButton: $("btn-new-game"),
-  reviewNote: $("review-note"),
   evalRail: $("eval-rail"),
   evalFill: $("eval-fill"),
   evalValue: $("eval-value"),
@@ -90,6 +90,7 @@ refs.moves = {
 
 let board = null;
 let panel = null;
+let reviewPanel = null;
 let tabs = null;
 let booting = false;
 
@@ -114,6 +115,8 @@ function renderAll() {
 
   panel.setGame(game);
   panel.refreshExport();
+  reviewPanel?.setGame(game);
+  reviewPanel?.update(game.review);
 
   const evalButton = document.querySelector('[data-action="eval"]');
   if (evalButton) evalButton.setAttribute("aria-pressed", String(app.evalVisible));
@@ -148,6 +151,10 @@ function stateFingerprint(state) {
     evaluation.enabled,
     evaluation.arrows,
     evaluation.score_text,
+    state.review ? state.review.status : "",
+    state.review && state.review.signature ? state.review.signature : "",
+    state.review && state.review.progress ? state.review.progress.done : "",
+    state.review && state.review.progress ? state.review.progress.total : "",
   ].join("|");
 }
 
@@ -789,16 +796,6 @@ function openImport() {
   requestAnimationFrame(() => panel?.textarea?.focus());
 }
 
-function showReviewNote() {
-  if (refs.reviewNote) refs.reviewNote.hidden = false;
-  toast({
-    title: "Game review follows in Phase 3",
-    description: "Live Stockfish evaluation and the approved win-probability model are already active.",
-    kind: "info",
-    duration: 5200,
-  });
-}
-
 function renderEngineStatusCard() {
   const engine = app.engine;
   if (!refs.engineStatusCard) return;
@@ -917,6 +914,10 @@ function wireShell() {
     onTabRequested: (name) => tabs.setActive(name),
   });
 
+  reviewPanel = new ReviewPanel({
+    onNavigate: (ply) => navigateTo(ply),
+  });
+
   refs.newGameButton?.addEventListener("click", () => openNewGame());
   refs.stageImport?.addEventListener("click", openImport);
   $("new-game-form")?.addEventListener("submit", startNewGame);
@@ -996,7 +997,6 @@ function wireShell() {
   });
   $("promotion-cancel")?.addEventListener("click", cancelPromotion);
 
-  $("btn-run-review")?.addEventListener("click", showReviewNote);
   $("btn-boot-retry")?.addEventListener("click", () => {
     if (refs.bootError) refs.bootError.hidden = true;
     bootstrap();
@@ -1016,6 +1016,9 @@ function wireShell() {
     pollEngine,
     setAnalysisOptions: (options) => call("set_analysis_options", options),
     configureEngine: (path) => call("configure_engine_path", path),
+    startGameReview: (preset, options) => call("start_game_review", preset, options),
+    cancelGameReview: () => call("cancel_game_review"),
+    getGameReview: (full) => call("get_game_review", full),
     toggleEval,
     toggleArrows,
     startGame: async (mode, options) => {

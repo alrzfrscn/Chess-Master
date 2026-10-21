@@ -598,10 +598,10 @@
                 <p class="eyebrow">Analysis</p>
                 <h2>Game review</h2>
               </div>
-              <span class="panel-chip panel-chip-warm">Phase 3</span>
+              <span class="panel-chip panel-chip-warm" id="review-state-chip">Ready</span>
             </div>
 
-            <div class="review-hero">
+            <div class="review-hero" id="review-hero">
               <div class="review-orbit" aria-hidden="true">
                 <span class="orbit-ring orbit-ring-a"></span>
                 <span class="orbit-ring orbit-ring-b"></span>
@@ -611,71 +611,93 @@
                 <span class="orbit-dot orbit-dot-a"></span>
                 <span class="orbit-dot orbit-dot-b"></span>
               </div>
-              <h3>See the game behind the moves.</h3>
-              <p>
-                Stockfish will grade every ply, surface turning points, and measure accuracy against the
-                approved Lichess logistic model.
+              <h3 id="review-hero-title">See the game behind the moves.</h3>
+              <p id="review-hero-copy">
+                Stockfish grades every non-book ply, confirms Brilliant and Great moves two plies deeper,
+                and measures accuracy with the approved review model.
               </p>
-              <button type="button" class="btn btn-primary btn-wide" id="btn-run-review">
-                <svg class="icon"><use href="#i-sparkles" /></svg>
-                <span>Run game review</span>
-              </button>
+
+              <div class="review-presets" id="review-presets" role="group" aria-label="Review strength">
+                <button type="button" class="review-preset" data-review-preset="fast">
+                  <strong>Fast</strong><span>depth 10</span>
+                </button>
+                <button type="button" class="review-preset is-active" data-review-preset="standard" aria-pressed="true">
+                  <strong>Standard</strong><span>depth 14</span>
+                </button>
+                <button type="button" class="review-preset" data-review-preset="deep">
+                  <strong>Deep</strong><span>depth 16</span>
+                </button>
+              </div>
+
+              <div class="review-actions">
+                <button type="button" class="btn btn-primary btn-wide" id="btn-run-review">
+                  <svg class="icon"><use href="#i-sparkles" /></svg>
+                  <span id="review-run-label">Run game review</span>
+                </button>
+                <button type="button" class="btn btn-quiet btn-wide" id="btn-cancel-review" hidden>
+                  <svg class="icon"><use href="#i-x" /></svg>
+                  <span>Cancel review</span>
+                </button>
+              </div>
+
+              <div class="review-progress" id="review-progress" hidden>
+                <div class="review-progress-head">
+                  <span id="review-progress-phase">Scanning</span>
+                  <span id="review-progress-count">0 / 0</span>
+                </div>
+                <div class="review-progress-track">
+                  <span class="review-progress-fill" id="review-progress-fill"></span>
+                </div>
+              </div>
+
               <div class="review-model">
                 <span class="model-dot"></span>
-                Lichess logistic · model v1 locked
+                <span id="review-model-label">Lichess logistic · depth 14 · MultiPV 3</span>
               </div>
             </div>
 
             <div class="review-stats">
               <div class="review-stat">
                 <span class="review-stat-label">Accuracy</span>
-                <strong class="review-stat-value">—</strong>
+                <strong class="review-stat-value" id="review-accuracy">—</strong>
                 <span class="review-stat-unit">white · black</span>
               </div>
               <div class="review-stat">
                 <span class="review-stat-label">ACPL</span>
-                <strong class="review-stat-value">—</strong>
+                <strong class="review-stat-value" id="review-acpl">—</strong>
                 <span class="review-stat-unit">avg. centipawn loss</span>
               </div>
               <div class="review-stat">
-                <span class="review-stat-label">Best moves</span>
-                <strong class="review-stat-value">—</strong>
-                <span class="review-stat-unit">of 0 plies</span>
+                <span class="review-stat-label">Estimated Elo</span>
+                <strong class="review-stat-value" id="review-elo">—</strong>
+                <span class="review-stat-unit">single-game estimate</span>
               </div>
             </div>
 
-            <div class="review-checklist">
-              <div class="check-row">
-                <span class="check-icon is-done"><svg class="icon"><use href="#i-check" /></svg></span>
-                <div>
-                  <p>PGN replay &amp; legal validation</p>
-                  <span>Python-chess is the authority</span>
-                </div>
-                <span class="phase-chip">Ready</span>
+            <div class="review-opening" id="review-opening" hidden>
+              <span class="review-opening-eco" id="review-opening-eco">—</span>
+              <div class="review-opening-copy">
+                <strong id="review-opening-name">—</strong>
+                <span id="review-opening-meta">—</span>
               </div>
-              <div class="check-row">
-                <span class="check-icon is-done"><svg class="icon"><use href="#i-check" /></svg></span>
-                <div>
-                  <p>Stockfish worker &amp; depth lock</p>
-                  <span>One process, one owner thread</span>
-                </div>
-                <span class="phase-chip">Ready</span>
+            </div>
+
+            <div class="review-counts" id="review-counts" hidden></div>
+
+            <div class="review-moves" id="review-moves" hidden>
+              <div class="review-moves-head">
+                <span>Move</span>
+                <span>Grade</span>
+                <span class="review-moves-loss">Win% loss</span>
               </div>
-              <div class="check-row">
-                <span class="check-icon"><svg class="icon"><use href="#i-target" /></svg></span>
-                <div>
-                  <p>Classification &amp; accuracy pipeline</p>
-                  <span>Blunder, Miss, Great, Brilliant</span>
-                </div>
-                <span class="phase-chip phase-chip-warm">Phase 3</span>
-              </div>
+              <div class="review-move-list" id="review-move-list"></div>
             </div>
 
             <div class="review-note" id="review-note" hidden>
               <svg class="icon"><use href="#i-info" /></svg>
-              <p>
-                Full game review arrives in Phase 3. Phase 2 already ships live Stockfish
-                evaluation and the approved win-probability model.
+              <p id="review-note-copy">
+                Reviews run on the shared Stockfish worker. Nothing is graded while a review is running
+                unless you cancel it.
               </p>
             </div>
           </section>
