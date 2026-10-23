@@ -54,7 +54,7 @@ def get_json(url: str) -> dict:
 def test_health_reports_phase_three_and_engine(server: WebAppServer) -> None:
     info = get_json(f"{server.url}api/health")
     assert info["ok"] is True
-    assert info["data"]["phase"] == 3
+    assert info["data"]["phase"] == 4
     assert info["data"]["capabilities"]["engine"] is True
     assert info["data"]["engine"]["available"] is True
     assert info["data"]["elo"]["min"] == 400

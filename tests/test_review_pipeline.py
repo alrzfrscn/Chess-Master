@@ -60,8 +60,8 @@ def test_pipeline_grades_every_non_book_ply_and_builds_the_report() -> None:
         on_progress=progress.append,
     )
 
-    assert report["schema_version"] == 1
-    assert report["phase"] == 3
+    assert report["schema_version"] == 2
+    assert report["phase"] == 4
     assert report["status"] == "complete"
     assert report["game_id"] == "contract"
     assert report["signature"] == request.signature
@@ -146,10 +146,77 @@ def test_pipeline_grades_every_non_book_ply_and_builds_the_report() -> None:
     ):
         assert key in moves_report[0]
 
+    assert moves_report[0]["best_move"]["uci"] == "e2e4"
+    assert moves_report[0]["best_move"]["san"] == "e4"
+    assert moves_report[0]["best_move"]["is_played"] is True
+    assert moves_report[1]["best_move"]["uci"] == "d7d5"
+    assert moves_report[1]["best_move"]["is_played"] is False
+    assert moves_report[0]["pv_followup"] is None
+
+    chart = report["eval_chart"]
+    assert chart["total_plies"] == 4
+    assert chart["midline"] == 50.0
+    assert len(chart["points"]) == 5
+    assert chart["points"][0]["ply"] == 0
+    assert chart["points"][4]["ply"] == 4
+    assert [point["classification"] for point in chart["points"][1:]] == [
+        "best",
+        "good",
+        "excellent",
+        "best",
+    ]
+    assert report["key_moments"] == []
+
     assert progress
     assert progress[-1]["phase"] == "complete"
     assert progress[-1]["percent"] == 100.0
     assert any(item["phase"] == "scan" for item in progress)
+
+
+def test_report_exposes_best_move_and_a_playable_followup_line() -> None:
+    moves = ("e2e4", "e7e5")
+    fens = _fen_sequence(chess.STARTING_FEN, moves)
+    pv_by_fen = {
+        fens[0]: ("e2e4", 20, ["e2e4", "e7e5", "g1f3"]),
+        fens[1]: ("e7e5", 15, ["e7e5", "g1f3", "b8c6"]),
+        fens[2]: ("g1f3", 10, ["g1f3", "b8c6", "f1b5"]),
+    }
+
+    def search(board: chess.Board, depth: int, multipv: int) -> ReviewSearchResult:
+        uci, cp, pv = pv_by_fen[board.fen()]
+        return ReviewSearchResult(
+            lines=[{"rank": 1, "uci": uci, "score_cp": cp, "pv_uci": pv}],
+            depth=depth,
+            multipv=multipv,
+            time_ms=5,
+        )
+
+    request = ReviewRequest(
+        game_id="followup",
+        start_fen=chess.STARTING_FEN,
+        moves=moves,
+        preset="fast",
+        use_book=False,
+    )
+    report = run_game_review(request, search)
+
+    first = report["moves"][0]
+    assert first["best_move"]["uci"] == "e2e4"
+    followup = first["pv_followup"]
+    assert followup["start_fen"] == fens[1]
+    assert followup["uci"] == ["e7e5", "g1f3", "b8c6"]
+    assert followup["san"] == ["e5", "Nf3", "Nc6"]
+    assert followup["fens"] == [
+        fens[1],
+        followup["moves"][0]["fen_after"],
+        followup["moves"][1]["fen_after"],
+        followup["moves"][2]["fen_after"],
+    ]
+    assert followup["moves"][0]["color"] == "black"
+    assert followup["moves"][0]["move_number"] == 1
+    assert followup["moves"][1]["color"] == "white"
+    assert followup["moves"][1]["move_number"] == 2
+    assert report["moves"][1]["pv_followup"]["uci"] == ["g1f3", "b8c6", "f1b5"]
 
 
 def test_book_prefix_is_skipped_and_unscored() -> None:

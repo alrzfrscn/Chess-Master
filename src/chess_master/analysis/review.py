@@ -60,12 +60,13 @@ __all__ = [
     "run_game_review",
 ]
 
-REVIEW_SCHEMA_VERSION = 1
+REVIEW_SCHEMA_VERSION = 2
 REVIEW_MULTIPV = 3
 CONFIRM_DEPTH_BONUS = 2
 CONFIRM_DEPTH_CAP = 18
 MAX_CPL = 1000
 MAX_CONFIRM_ROUNDS = 3
+KEY_MOMENT_CLASSES = ("brilliant", "great", "inaccuracy", "mistake", "miss", "blunder")
 
 REVIEW_PRESETS: dict[str, dict[str, Any]] = {
     "fast": {"label": "Fast", "depth": 10, "confirm_depth": 12, "description": "Quick scan"},
@@ -247,6 +248,87 @@ def _line_san(line: Mapping[str, Any] | None, board: chess.Board, uci: str | Non
     return None
 
 
+def _move_descriptor(board: chess.Board, uci: str | None) -> dict[str, Any] | None:
+    """Describe a legal UCI move in the position, or ``None`` when it is not."""
+
+    if not uci:
+        return None
+    try:
+        move = chess.Move.from_uci(str(uci))
+    except ValueError:
+        return None
+    if move not in board.legal_moves:
+        return None
+    return {
+        "uci": move.uci(),
+        "san": board.san(move),
+        "from": chess.square_name(move.from_square),
+        "to": chess.square_name(move.to_square),
+        "promotion": chess.piece_symbol(move.promotion) if move.promotion else None,
+    }
+
+
+def _line_pv(line: Mapping[str, Any] | None) -> list[str]:
+    """Return the principal variation as a clean list of legal-looking UCI strings."""
+
+    if line is None:
+        return []
+    pv = line.get("pv_uci") or []
+    if not isinstance(pv, Sequence) or isinstance(pv, (str, bytes)):
+        return []
+    return [str(value) for value in pv if value]
+
+
+def _followup_payload(
+    board_after: chess.Board,
+    line: Mapping[str, Any] | None,
+    base_ply: int,
+) -> dict[str, Any] | None:
+    """Turn the engine's continuation after the played move into a playable line.
+
+    The payload carries both SAN and UCI plus every intermediate FEN, so the
+    frontend can step through the line without any engine calls or chess rules.
+    """
+
+    pv = _line_pv(line)
+    if not pv:
+        return None
+
+    start_fen = board_after.fen()
+    board = board_after.copy(stack=False)
+    moves: list[dict[str, Any]] = []
+    for offset, uci in enumerate(pv[:8]):
+        descriptor = _move_descriptor(board, uci)
+        if descriptor is None:
+            break
+        before = board.fen()
+        move_number = board.fullmove_number
+        color = "white" if board.turn == chess.WHITE else "black"
+        board.push(chess.Move.from_uci(descriptor["uci"]))
+        moves.append(
+            {
+                **descriptor,
+                "ply": int(base_ply) + offset + 1,
+                "move_number": move_number,
+                "color": color,
+                "fen_before": before,
+                "fen_after": board.fen(),
+            }
+        )
+    if not moves:
+        return None
+
+    return {
+        "start_fen": start_fen,
+        "uci": [move["uci"] for move in moves],
+        "san": [move["san"] for move in moves],
+        "fens": [start_fen, *[move["fen_after"] for move in moves]],
+        "moves": moves,
+        "depth": int(line.get("depth") or 0) if line else 0,
+        "source": "after_position",
+    }
+
+
 def _terminal_result(board: chess.Board) -> ReviewSearchResult | None:
     """A synthetic top line for a position where Stockfish must not search."""
 
@@ -303,6 +385,8 @@ def _blank_eval() -> dict[str, Any]:
         "best_uci": None,
         "best_san": None,
         "best_eval": None,
+        "best_move": None,
+        "pv_followup": None,
         "pv": [],
         "multi_pv": [],
         "depth": 0,
@@ -455,6 +539,18 @@ def _apply_evals(
         cp_loss = 0.0
 
     best_uci = _line_uci(best_before)
+    best_move = _move_descriptor(board_before, best_uci)
+    if best_move is not None:
+        best_move.update(
+            {
+                "score_cp": clamp_review_cp(cp_before) if cp_before is not None else None,
+                "mate": _line_mate(best_before),
+                "win_prob_white": round(win_white_before, 2),
+                "is_played": best_uci == record["uci"],
+                "rank": 1,
+            }
+        )
+    board_after = boards[ply]
     record.update(
         {
             "eval_before": clamp_review_cp(cp_before) if cp_before is not None else None,
@@ -468,6 +564,8 @@ def _apply_evals(
             "best_uci": best_uci,
             "best_san": _line_san(best_before, board_before, best_uci),
             "best_eval": clamp_review_cp(cp_before) if cp_before is not None else None,
+            "best_move": best_move,
+            "pv_followup": _followup_payload(board_after, best_after, ply),
             "pv": list(best_before.get("pv_uci") or []) if best_before else [],
             "multi_pv": [
                 {
@@ -779,7 +877,7 @@ def run_game_review(
     report: dict[str, Any] = {
         "available": True,
         "schema_version": REVIEW_SCHEMA_VERSION,
-        "phase": 3,
+        "phase": 4,
         "status": "complete",
         "game_id": request.game_id,
         "signature": request.signature,
@@ -817,6 +915,8 @@ def run_game_review(
             },
             "counts": counts,
         },
+        "eval_chart": _chart_payload(request, records, win_probs_white, evals),
+        "key_moments": _key_moments(records),
         "progress": {
             "done": progress.done,
             "total": progress.total,
@@ -869,3 +969,90 @@ def _win_sequence(
     # the book prefix from the first real evaluation.
     first_known = next((value for value in values if value is not None), 50.0)
     return [float(value if value is not None else first_known) for value in values]
+
+
+def _chart_payload(
+    request: ReviewRequest,
+    records: Sequence[Mapping[str, Any]],
+    win_probs_white: Sequence[float],
+    evals: Mapping[int, _PositionEval],
+) -> dict[str, Any]:
+    """Position-by-position advantage curve for the interactive SVG chart."""
+
+    if _is_standard_start(request):
+        start_cp: int | None = 15
+        start_mate: int | None = None
+    else:
+        entry = evals.get(0)
+        start_cp = _line_cp_white(entry.best) if entry and entry.best else None
+        start_mate = _line_mate(entry.best) if entry else None
+
+    points: list[dict[str, Any]] = [
+        {
+            "ply": 0,
+            "win_prob_white": round(float(win_probs_white[0]), 2),
+            "eval_cp": clamp_review_cp(start_cp) if start_cp is not None else None,
+            "mate": start_mate,
+            "classification": None,
+            "san": None,
+            "uci": None,
+            "move_number": None,
+            "color": None,
+            "is_book": False,
+            "accuracy": None,
+            "win_loss": None,
+        }
+    ]
+    last_cp = start_cp
+    last_mate = start_mate
+    for record in records:
+        if record.get("eval_after") is not None:
+            last_cp = int(record["eval_after"])
+            last_mate = record.get("mate_after")
+        ply = int(record["ply"])
+        points.append(
+            {
+                "ply": ply,
+                "win_prob_white": round(float(win_probs_white[ply]), 2),
+                "eval_cp": last_cp,
+                "mate": last_mate,
+                "classification": record.get("classification"),
+                "san": record.get("san"),
+                "uci": record.get("uci"),
+                "move_number": record.get("move_number"),
+                "color": record.get("color"),
+                "is_book": bool(record.get("is_book")),
+                "accuracy": record.get("accuracy"),
+                "win_loss": record.get("win_loss"),
+            }
+        )
+    return {"total_plies": len(records), "midline": 50.0, "points": points}
+
+
+def _key_moments(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Turning points the review panel can jump between with one key."""
+
+    moments: list[dict[str, Any]] = []
+    for record in records:
+        classification = str(record.get("classification") or "")
+        if classification not in KEY_MOMENT_CLASSES:
+            continue
+        moments.append(
+            {
+                "ply": int(record["ply"]),
+                "move_number": record.get("move_number"),
+                "color": record.get("color"),
+                "san": record.get("san"),
+                "uci": record.get("uci"),
+                "classification": classification,
+                "symbol": record.get("symbol"),
+                "label": record.get("label"),
+                "win_loss": record.get("win_loss"),
+                "win_before": record.get("win_before"),
+                "win_after": record.get("win_after"),
+                "eval_before": record.get("eval_before"),
+                "eval_after": record.get("eval_after"),
+                "accuracy": record.get("accuracy"),
+            }
+        )
+    return moments

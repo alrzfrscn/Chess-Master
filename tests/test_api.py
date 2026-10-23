@@ -33,7 +33,7 @@ def assert_error(response: dict, code: str) -> dict:
 
 def test_api_info(api: ChessMasterApi) -> None:
     data = assert_ok(api.get_api_info())
-    assert data["phase"] == 3
+    assert data["phase"] == 4
     assert data["analysis"]["winprob"] == "lichess-logistic"
     assert set(
         [

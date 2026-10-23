@@ -1,38 +1,64 @@
 # Chess Master
 
 A local-first chess desktop studio built with Python, PyWebView, Chessground,
-Stockfish and chess.js. Phase 2 turns the two-player table into a complete
-engine playground: **Play vs Stockfish from 400 to 3000 Elo**, live White-POV
-evaluation, best-move arrows, a single-owner engine worker, and the Phase 1 PGN,
-FEN, branching and review foundations intact.
+Stockfish and chess.js. **v1.0.0 completes the four-phase build**: a full
+Pass & Play and Stockfish table, PGN/FEN study tools, and a Chess.com-style
+**Game Review** with move classification, dual arrows, an interactive advantage
+curve, a coach with a playable engine line, player summaries and a
+ten-tier accuracy matrix.
 
-![Chess Master Phase 2 desktop](docs/phase2-1440x900.png)
+![Chess Master v1.0.0 Game Review](docs/phase4-review-1440x900.png)
 
-## What ships in Phase 2
+## What ships in v1.0.0
 
-- **Play vs Stockfish.** Choose White, Black or a random side and an Elo from
-  400 to 3000. Presets: Beginner 600, Casual 1000, Club 1400, Advanced 1800,
-  Master 2200, Grandmaster 2600 and Maximum 3000.
+### Play
+
+- **Pass & Play** on one local table.
+- **Play vs Stockfish** from 400 to 3000 Elo, as White, Black or a random side.
+  Presets: Beginner 600, Casual 1000, Club 1400, Advanced 1800, Master 2200,
+  Grandmaster 2600 and Maximum 3000.
 - **One engine, one owner thread.** A dedicated worker owns a single Stockfish
-  process, coalesces jobs by kind, prioritizes bot moves, and pre-empts stale
-  searches when the game revision changes.
-- **Stale-result protection.** Every job carries
-  `(game_id, revision, ply, fen)`. Results are discarded unless the token still
-  matches the live revision; bot moves are committed only when the token matches
-  at the live tip.
-- **Live evaluation.** MultiPV 3 at depth 16 with a time budget, normalized to
-  White POV and rendered as a smooth win-probability rail. The approved Lichess
-  logistic model supplies `win_prob_white`; labels include `+1.4`, `-0.8`,
-  `0.0`, `M3` and `-M2`.
-- **Best-move arrows.** Toggle the engine arrow in Pass & Play, Stockfish and
-  Import modes. It clears on a move, navigation, or when switched off.
-- **Engine setup.** Discovery order is explicit config/CLI, `STOCKFISH_PATH`,
-  project `bin/` and `assets/engine/`, then `PATH`. A path dialog is available
-  from the sidebar and the engine strip.
-- **Graceful offline state.** A missing or failed binary becomes a visible
-  warning strip and a clear note; it never blocks Pass & Play.
-- **Phase 2 UI captures.** Gameplay and engine dialogs are stored at
-  `1280 x 820` and `1440 x 900` in [`docs/`](docs/).
+  process, coalesces jobs by kind, prioritizes bot moves and pre-empts stale
+  searches. Every job carries `(game_id, revision, ply, fen)`; late results are
+  discarded unless the token still matches the live revision.
+- **Live analysis.** MultiPV 3 at depth 16 with a time budget, normalized to
+  White POV, with a smooth win-probability rail and optional best-move arrow.
+- **Import and study.** PGN headers and comments round-trip, PGN variations are
+  reported as skipped metadata, FEN imports become playable custom roots, and
+  playing from history creates a new branch.
+- **Engine discovery.** Explicit config/CLI, `STOCKFISH_PATH`, project `bin/`
+  and `assets/engine/`, then `PATH`, with a path dialog and a graceful offline
+  state that never blocks Pass & Play.
+
+### Game Review
+
+- **Classify every move** into ten tiers: Brilliant, Great, Best, Excellent,
+  Good, Book, Inaccuracy, Mistake, Miss and Blunder. Results use win-probability
+  loss, forced-move handling, book detection and a confirmation pass.
+- **On-board badges and tints.** The destination square gets a subtle tint and a
+  circular badge at its top-right, correct in both board orientations and after
+  pressing `F`.
+- **Dual arrows.** The played move is drawn in its classification colour; when
+  the engine preferred another move, the best alternative is drawn in emerald.
+- **Interactive advantage chart.** White and Black areas meet at the 50 %
+  midline, critical moments are dotted, the playhead tracks the current ply,
+  hovering shows `Move · SAN · Eval · Classification`, and clicking a point jumps
+  to that position. Arrow keys work when the chart has focus.
+- **Coach card.** SAN header, classification pill, forced marker, accuracy,
+  evaluation transition, plain-language explanation and the best alternative.
+- **PV follow-up sandbox.** `Show Follow-Up` plays the engine continuation on the
+  board with `← Step`, `Step →`, `Play Line` and `Back to Game`, a progress
+  banner, and `Escape` to exit.
+- **Dual player summary.** Names and avatars, large accuracies, an estimated Elo
+  in the 400–3000 range, ACPL and per-phase accuracy.
+- **Classification matrix.** Every tier shows White and Black counts; clicking a
+  row filters the move list and jumps to the next matching move, while clicking a
+  count filters that colour.
+- **Key moments.** `Prev key moment` / `Next key moment` (or `K`, `Shift+K`,
+  `Space`) walk the turning points; the counter shows your place in the list.
+- **Review CTAs.** A finished game or a successful PGN import offers
+  `Analyze in Game Review` in the Moves panel, switches to Review and starts or
+  reopens the report.
 
 ## Quick start
 
@@ -41,11 +67,11 @@ FEN, branching and review foundations intact.
 - Windows 10/11 with the Microsoft Edge WebView2 runtime.
 - Python 3.11 or newer.
 - Node.js 20+ only when rebuilding CSS or vendor assets.
-- A Stockfish binary. Place one at `bin/stockfish/` (the Phase 2 build used
+- A Stockfish binary. Place one at `bin/stockfish/` (the v1.0.0 build used
   Stockfish 19 universal on Windows), set `STOCKFISH_PATH`, or choose it in
   **Engine setup**. The local `bin/` folder is ignored by git.
 
-### Install and run
+### Install and run the desktop app
 
 ```powershell
 python -m venv .venv
@@ -66,7 +92,7 @@ install.
 
 ### Development browser
 
-The same UI can run headlessly with a loopback JSON API:
+The same UI can run with a loopback JSON API:
 
 ```powershell
 $env:PYTHONPATH = "src"
@@ -74,22 +100,22 @@ $env:PYTHONPATH = "src"
 ```
 
 Open <http://127.0.0.1:8765/>. The HTTP API is deliberately disabled unless
-`--serve` or `--http-api` is used; the normal desktop window talks to Python
-through the PyWebView bridge instead.
+`--serve` or `--http-api` is used; the desktop window talks to Python through the
+PyWebView bridge instead.
 
 ### Build and test
 
 ```powershell
 npm install
 npm run build          # sync vendor assets + compile Tailwind CSS
-.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m pytest -q
 $env:PYTHONPATH = "src"
 .\.venv\Scripts\python.exe -m chess_master --smoke-test
 ```
 
 `npm run build` is only needed after changing Tailwind source, vendored
-libraries or design assets. The compiled CSS and bundled vendor files are
-already included in the repository tree.
+libraries or design assets. The compiled CSS and vendor files are already in the
+repository tree.
 
 ## Controls
 
@@ -104,23 +130,28 @@ already included in the repository tree.
 | `E` | Toggle the eval rail |
 | `A` | Toggle the best-move arrow |
 | `I` | Open the Import / Export tab |
-| New game | Choose Pass & Play or Play vs Stockfish, color and strength |
+| `K` / `Space` | Next key moment in Review |
+| `Shift+K` | Previous key moment |
+| `Escape` | Leave the PV follow-up sandbox |
+| Chart `←` / `→` / `Home` / `End` | Step through the reviewed line when the chart is focused |
 
 The board is locked while a request is in flight, after checkmate or a draw,
-while the promotion picker is open, and whenever it is Stockfish's turn. The
-engine game auto-orients the board to your chosen color on start; manual flip is
-still available. Chessground only exposes destinations that chess.js reports as
-legal for the viewed FEN; the backend revalidates every submitted move.
+while the promotion picker is open, and whenever it is Stockfish's turn. Chess
+Master auto-orients the board to your chosen colour in an engine game; manual
+flip is always available. Chessground only exposes destinations that chess.js
+reports as legal for the viewed FEN; the backend revalidates every submitted
+move.
 
 ## Project layout
 
-```
+```text
 Chess Master/
 |-- src/chess_master/
 |   |-- app.py                 PyWebView window, dev server, smoke test, --engine
 |   |-- paths.py               Project, bin, assets and web roots
 |   |-- analysis/
-|   |   `-- winprob.py         Approved Lichess logistic model + accuracy math
+|   |   |-- review.py          Two-pass Game Review pipeline + report contract
+|   |   `-- winprob.py         Lichess logistic model, accuracy, ACPL, Elo
 |   |-- bridge/
 |   |   |-- api.py             JS API envelope, session lock, engine polling
 |   |   `-- web_server.py      Loopback static server + optional dev JSON API
@@ -136,20 +167,20 @@ Chess Master/
 |   |   `-- errors.py          Stable domain error codes
 |   |-- models/
 |   |   |-- game.py            MoveRecord and PlayerInfo
-|   |   `-- samples.py         Tested sample games and positions
+|   |   `-- samples.py         Curated sample games, including the Opera Game
 |   `-- web/
-|       |-- index.html         Desktop interface shell
-|       |-- src/styles.css     Tailwind v4 source and visual system
+|       |-- index.html         Desktop interface shell + SVG icon sprite
+|       |-- src/styles.css     Tailwind v4 source and visual token system
 |       `-- assets/
 |           |-- css/app.css    Compiled stylesheet
-|           |-- js/            api, state, board, players, moves, panels, app
+|           |-- js/            api, state, board, players, moves, reviewPanel, app
 |           |-- fonts/         Fira Sans and Fira Code (OFL)
 |           |-- pieces/        Bundled SVG piece set
 |           `-- vendor/        Chessground 9.2.1 and chess.js 1.4.0
 |-- bin/stockfish/             Local Stockfish binary (not a build artifact)
-|-- tests/                     138 pytest checks across 10 modules
+|-- tests/                     180 pytest checks across 14 modules
 |-- scripts/sync_vendor.mjs    Reproducible vendor asset sync
-|-- docs/                      Phase 1 and Phase 2 UI captures + Phase 2 report
+|-- docs/                      Phase 1–4 UI captures and engineering reports
 |-- package.json               Tailwind CLI + vendor build tooling
 |-- pyproject.toml             Python package and pytest configuration
 |-- THIRD_PARTY_NOTICES.md
@@ -186,16 +217,18 @@ JSON-serializable envelope:
 | `set_analysis_options` | `{"enabled","arrows","depth","multipv"}` | Options plus current evaluation and engine |
 | `configure_engine_path` | `path` or `null`/`""` to auto-detect | Engine and evaluation payloads |
 | `get_engine_status` | none | Engine, evaluation, cache, analysis options, model |
+| `start_game_review` | preset (`fast`/`standard`/`deep`), options `{"force","use_book"}` | Review status envelope |
+| `cancel_game_review` | none | Review status envelope |
+| `get_game_review` | `full=True` to include the report | Review payload |
 | `export_pgn` | none | `{pgn, fen, headers, ply, total_plies}` |
-| `get_api_info` | none | Bridge metadata, capabilities, Elo presets and model identifiers |
-| `get_samples` | none | Six curated PGN/FEN samples |
+| `get_api_info` | none | Bridge metadata, capabilities, Elo presets, model identifiers, review capabilities |
+| `get_samples` | none | Curated PGN/FEN samples |
 
 `engine_poll` is the single non-blocking polling primitive used by both
 transports. It never waits for a search; it promotes a completed bot move when
 its token still matches, queues missing work, and returns the composed state.
 `new_game(mode="stockfish", ...)` requires `bot_elo` in `[400, 3000]` and accepts
-`player_color` of `"white"`, `"black"` or `"random"`. The chosen color is
-resolved in the returned state and drives board orientation.
+`player_color` of `"white"`, `"black"` or `"random"`.
 
 Stable error codes: `invalid_fen`, `invalid_pgn`, `illegal_move`,
 `promotion_required`, `invalid_ply`, `game_over`, `invalid_mode`,
@@ -204,8 +237,7 @@ Stable error codes: `invalid_fen`, `invalid_pgn`, `illegal_move`,
 
 ### Game state
 
-The full state contract is documented in the Phase 2 engineering report and is
-exercised by the test suite. Important fields:
+The full state contract is exercised by the test suite. Important fields:
 
 | Field | Meaning |
 | --- | --- |
@@ -215,10 +247,31 @@ exercised by the test suite. Important fields:
 | `last_move`, `is_viewing_live`, `branch_available` | Timeline state |
 | `headers`, `event`, `source`, `mode`, `mode_label` | Provenance and PGN metadata |
 | `import_meta` | Variation count, comment count and warnings |
-| `engine` | Availability, status, path, bot color/Elo/profile, thinking, jobs, analysis options |
-| `evaluation` | White-POV score, mate, win probability, MultiPV lines, PV SAN, best move, token, cache flag |
-| `review` | Explicit Phase 3 placeholder |
+| `engine` | Availability, status, path, bot colour/Elo, thinking, jobs, analysis options |
+| `evaluation` | White-POV score, mate, win probability, MultiPV lines, PV SAN, best move, token |
+| `review` | Review availability, status, progress, summary, opening and error |
 | `revision`, `game_id`, `schema_version` | Diagnostics and cache invalidation |
+
+### Game Review report
+
+`start_game_review` runs a two-pass pipeline: a base search on every position,
+then confirmation searches on classification boundaries. The report is additive
+to the game state and uses `REVIEW_SCHEMA_VERSION = 2`:
+
+| Field | Meaning |
+| --- | --- |
+| `moves[]` | Per-ply SAN/UCI, colour, accuracy, win loss, classification, forced/book flags, explanation, `best_move`, `pv_followup` |
+| `best_move` | `{uci, san, from, to, score_cp, mate, is_played}` |
+| `pv_followup` | `{start_fen, uci[], san[], fens[], moves[]}`, capped at 8 plies for the sandbox |
+| `eval_chart` | `points[]` with ply, White win probability, eval, mate and classification |
+| `key_moments` | Ordered turning points used by `K` / `Space` |
+| `summary` / `players` | Accuracy, ACPL, estimated Elo, phase accuracy, counts by tier |
+| `matrix` | Ten-tier White/Black counts |
+| `timing`, `opening`, `totals` | Searches, cache hits, elapsed time, ECO/name, graded/confirmed counts |
+
+Presets are **Fast** (depth 10 base, 12 confirm), **Standard** (14/16) and
+**Deep** (18/20). Book moves are detected from the bundled opening data and can
+be skipped with `use_book=false`.
 
 ### Development HTTP transport
 
@@ -226,6 +279,26 @@ exercised by the test suite. Important fields:
 `GET /api/health`; static files are served from the same loopback origin. This
 transport exists for browser testing and headless verification, not for the
 packaged desktop window.
+
+## Review behaviour
+
+- **Classification.** Move quality is measured as the loss in White-POV win
+  probability, with separate thresholds for ordinary and forced moves. Book
+  moves are labelled before classification and do not enter accuracy/ACPL.
+- **Accuracy.** The approved Chess.com-style curve
+  `103.1668 * exp(-0.04354 * win_loss) - 3.1669` is used per move; player
+  accuracy is the mean, and ACPL is the mean centipawn loss among graded moves.
+- **Estimated Elo.** A capped 400–3000 estimate derived from accuracy and ACPL;
+  it is a training estimate, not a tournament rating.
+- **Phases.** Opening accuracy covers book-through-opening plies, middlegame
+  covers the rest, and endgame is shown as `—` when the game has no endgame
+  sample.
+- **Badges.** Brilliant `!!`, Great `!`, Best `★`, Excellent `✓`, Good `○`,
+  Book (book icon), Inaccuracy `?!`, Mistake `?`, Miss `✕`, Blunder `??`.
+  Colours are defined once as CSS tokens and reused by the matrix, coach, chart
+  and board overlay.
+- **PV cap.** Engine continuations are capped at 8 plies so the sandbox stays
+  readable and the board never becomes a second game.
 
 ## PGN, FEN and branching behavior
 
@@ -268,11 +341,8 @@ packaged desktop window.
   `PovScore.pov(chess.WHITE)`. Mate maps to exact 0/100 win probability;
   ordinary scores use the Lichess logistic curve with `K = 0.00368208` and a
   ±1500 cp clamp. Labels are `+1.4`, `-0.8`, `0.0`, `M3` and `-M2`.
-- **Per-move accuracy.** The approved Chess.com-style
-  `103.1668 * exp(-0.04354 * win_loss) - 3.1669` remains available for Phase 3
-  review; classification, ACPL and estimated Elo are not produced yet.
 
-## Tests
+## Tests and QA
 
 The suite covers session state, SAN/UCI parsing, navigation bounds, branching,
 promotion, checkmate/stalemate, reset behavior, PGN headers/comments/variations,
@@ -280,39 +350,47 @@ export round-tripping, FEN diagnostics, material accounting, JSON serialization,
 bridge envelopes, win-probability math, FEN normalization, mate/draw terminal
 evaluations, Elo profiles, weighted move selection, discovery priority, worker
 lifecycle/cancellation, cache reuse, HTTP engine transport, the complete Play vs
-Stockfish flow, Import-mode evaluation/arrows and human-as-Black orientation.
+Stockfish flow, Import-mode evaluation/arrows, human-as-Black orientation, the
+review report contract, PV follow-up, chart points and key moments.
 
 ```text
-138 passed in 9.77s
+180 passed in 9.21s
 ```
 
 Smoke test:
 
 ```text
 python -m chess_master --smoke-test
-2026-10-21 12:39:20 INFO chess_master.bridge.web_server: Serving Chess Master UI at http://127.0.0.1:53057/
-2026-10-21 12:39:20 INFO chess_master.app: Smoke-test window created (hidden); closing in 3 seconds.
+2026-10-22 10:31:15,538 INFO chess_master.bridge.web_server: Serving Chess Master UI at http://127.0.0.1:40550/
+2026-10-22 10:31:15,540 INFO chess_master.app: Smoke-test window created (hidden); closing in 3 seconds.
 ```
 
-Real-engine tests are marked `engine` and use the provisioned Stockfish binary.
+Browser QA used the Opera Game on a loopback server: chart hover and click,
+badge placement in both orientations, dual arrows, PV stepping and `Escape`,
+matrix filtering and row jumps, key moments via buttons and `K` / `Shift+K` /
+`Space`, and the game-over CTA. Captures at 1280 × 820 and 1440 × 900 live in
+[`docs/`](docs/).
 
-## Phase 2 limits
+## v1.0.0 limits
 
 - One Stockfish process per application instance. A second table cannot run a
   second engine concurrently.
-- Analysis is a live convenience, not a full review engine. Game Review,
-  classification, ACPL and accuracy reports remain Phase 3.
-- The Elo labels are calibrated personalities, not tournament ratings; below
-  1320 they are intentionally approximate.
 - One main line per session; PGN variations are read as metadata, not stored as
   a tree.
 - No persistence database: state and the analysis cache live in memory for the
   lifetime of the API object.
+- Review continuations are capped at 8 plies, and estimated Elo is a heuristic.
 - The HTTP API is for local development and is bound to `127.0.0.1`; it is not
   a remote service.
 
-See the full [Phase 2 engineering report](docs/PHASE2_REPORT.md) for the module
-tree, token protocol, Elo table, API schema and QA evidence.
+## Documentation
+
+- [Phase 2 engineering report](docs/PHASE2_REPORT.md) — engine, Elo and
+  evaluation foundations.
+- [Phase 3 engineering report](docs/PHASE3_REPORT.md) — design system, review
+  metrics and panel architecture.
+- [Phase 4 engineering report](docs/PHASE4_REPORT.md) — review dashboard, board
+  overlays, chart, PV sandbox, matrix, QA and final packaging.
 
 ## Third-party components and licensing
 

@@ -12,6 +12,7 @@ export const app = {
   evaluation: null,
   engine: null,
   activeTab: "moves",
+  preview: null,
   bridgeMode: null,
   busy: false,
   navigating: false,

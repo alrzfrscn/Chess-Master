@@ -62,6 +62,11 @@ const refs = {
   engineStatusTitle: $("engine-status-title"),
   engineStatusCopy: $("engine-status-copy"),
   engineStatusBadge: $("engine-status-badge"),
+  reviewCta: $("review-cta"),
+  reviewCtaTitle: $("review-cta-title"),
+  reviewCtaCopy: $("review-cta-copy-text"),
+  reviewCtaButton: $("btn-review-cta"),
+  reviewCtaLabel: $("btn-review-cta-label"),
 };
 
 refs.players = { top: refs.topPlayer, bottom: refs.bottomPlayer };
@@ -102,8 +107,10 @@ function renderAll() {
   const game = app.game;
   if (!game) return;
 
-  const interactive = !app.busy && !app.navigating && canHumanMove(game);
-  board.render(game, { orientation: app.orientation, canPlay: interactive });
+  const preview = reviewPanel?.previewState() || null;
+  app.preview = preview;
+  const interactive = !app.busy && !app.navigating && !preview && canHumanMove(game);
+  board.render(game, { orientation: app.orientation, canPlay: interactive, preview });
   renderPlayers(game, app.orientation, refs.players);
   renderMoves(game, refs.moves);
   renderHeader(game);
@@ -111,12 +118,13 @@ function renderAll() {
   renderModeNav(game);
   renderEval(game);
   renderEngineStrip();
-  syncArrows();
 
   panel.setGame(game);
   panel.refreshExport();
   reviewPanel?.setGame(game);
   reviewPanel?.update(game.review);
+  syncArrows();
+  renderReviewCta(game);
 
   const evalButton = document.querySelector('[data-action="eval"]');
   if (evalButton) evalButton.setAttribute("aria-pressed", String(app.evalVisible));
@@ -228,8 +236,21 @@ function isEngineOffline(engine) {
   return Boolean(engine && (!engine.available || engine.status === "error"));
 }
 
+function applyReviewScene() {
+  if (!board) return false;
+  const scene = reviewPanel?.boardScene(app.game, app.orientation, app.preview) || null;
+  if (scene) {
+    board.setArrows(scene.arrows || []);
+    board.setReviewOverlay(scene.overlay || null);
+    return true;
+  }
+  board.setReviewOverlay(null);
+  return false;
+}
+
 function syncArrows() {
   if (!board) return;
+  if (applyReviewScene()) return;
   const game = app.game;
   const evaluation = app.evaluation || (game && game.evaluation);
   if (!app.arrowsEnabled || !game || !evaluation || !evaluation.best_move) {
@@ -345,6 +366,28 @@ function renderSession(game) {
   if (refs.sessionSource) refs.sessionSource.textContent = sourceLabel(game);
 }
 
+function renderReviewCta(game) {
+  if (!refs.reviewCta) return;
+  const finished = Boolean(game && game.status?.state && game.status.state !== "in_progress");
+  const imported = Boolean(game && game.source === "pgn" && game.total_plies > 0);
+  const show = Boolean(game && game.total_plies > 0 && (finished || imported) && app.activeTab !== "review");
+  refs.reviewCta.hidden = !show;
+  if (!show) return;
+
+  const complete = Boolean(reviewPanel?.report);
+  if (refs.reviewCtaTitle) {
+    refs.reviewCtaTitle.textContent = finished ? "Game complete" : "Game imported";
+  }
+  if (refs.reviewCtaCopy) {
+    refs.reviewCtaCopy.textContent = complete
+      ? "Your Game Review is ready to reopen."
+      : "Grade every move, find the turning point and replay the engine line.";
+  }
+  if (refs.reviewCtaLabel) {
+    refs.reviewCtaLabel.textContent = complete ? "Open Game Review" : "Analyze in Game Review";
+  }
+}
+
 function bridgeStatus(status, info = null) {
   const dot = refs.bridgeDot;
   const footerDot = refs.bridgeState ? refs.bridgeState.querySelector(".status-dot") : null;
@@ -370,14 +413,14 @@ function bridgeStatus(status, info = null) {
   if (footerText) {
     footerText.textContent =
       status === "ready"
-        ? `Bridge ready · v${(info && info.version) || app.apiInfo?.version || "0.2.0"}`
+        ? `Bridge ready · v${(info && info.version) || app.apiInfo?.version || "1.0.0"}`
         : status === "error"
           ? "Bridge unavailable"
           : "Bridge handshake";
   }
 
   if (info && refs.appVersion) {
-    refs.appVersion.textContent = `v${info.version || "0.2.0"} · Phase ${info.phase || 2}`;
+    refs.appVersion.textContent = `v${info.version || "1.0.0"} · Phase ${info.phase || 4}`;
   }
 }
 
@@ -389,6 +432,7 @@ async function playMove(uci) {
   if (!uci || app.busy) return;
   const previous = app.game;
   const branching = Boolean(previous && previous.branch_available);
+  if (reviewPanel?.hasPreview()) reviewPanel.clearPreview();
   app.busy = true;
   board?.clearArrows();
   try {
@@ -436,6 +480,7 @@ async function navigateTo(index) {
   const target = Math.max(0, Math.min(total, Number(index)));
   if (!Number.isFinite(target) || target === app.game.ply) return;
 
+  if (reviewPanel?.hasPreview()) reviewPanel.clearPreview();
   app.navigating = true;
   board?.clearArrows();
   try {
@@ -717,8 +762,7 @@ async function toggleArrows() {
   app.arrowsEnabled = !app.arrowsEnabled;
   const button = document.querySelector('[data-action="arrows"]');
   if (button) button.setAttribute("aria-pressed", String(app.arrowsEnabled));
-  if (!app.arrowsEnabled) board?.clearArrows();
-  else syncArrows();
+  syncArrows();
   renderEngineStrip();
   if (app.arrowsEnabled && isEngineOffline(app.engine)) {
     toast({
@@ -900,6 +944,7 @@ function wireShell() {
     onChange: (name) => {
       app.activeTab = name;
       if (name === "import") panel?.refreshExport();
+      renderReviewCta(app.game);
     },
   });
 
@@ -916,10 +961,22 @@ function wireShell() {
 
   reviewPanel = new ReviewPanel({
     onNavigate: (ply) => navigateTo(ply),
+    onPreview: (preview) => {
+      app.preview = preview;
+      renderAll();
+    },
+    onSceneChange: () => {
+      applyReviewScene();
+      renderReviewCta(app.game);
+    },
   });
 
   refs.newGameButton?.addEventListener("click", () => openNewGame());
   refs.stageImport?.addEventListener("click", openImport);
+  refs.reviewCtaButton?.addEventListener("click", () => {
+    tabs.setActive("review");
+    reviewPanel?.focusOrStart();
+  });
   $("new-game-form")?.addEventListener("submit", startNewGame);
   $("engine-form")?.addEventListener("submit", configureEngine);
   $("btn-engine-auto")?.addEventListener("click", autoDetectEngine);
@@ -1019,6 +1076,13 @@ function wireShell() {
     startGameReview: (preset, options) => call("start_game_review", preset, options),
     cancelGameReview: () => call("cancel_game_review"),
     getGameReview: (full) => call("get_game_review", full),
+    getReviewPanel: () => reviewPanel,
+    getReviewReport: () => reviewPanel?.report || null,
+    jumpKeyMoment: (direction = 1) => reviewPanel?.jumpKeyMoment(direction),
+    showFollowUp: () => reviewPanel?.startPreview(),
+    clearFollowUp: () => reviewPanel?.clearPreview(),
+    getPreview: () => reviewPanel?.previewState() || null,
+    getBoardScene: () => reviewPanel?.boardScene(app.game, app.orientation, app.preview) || null,
     toggleEval,
     toggleArrows,
     startGame: async (mode, options) => {
@@ -1037,6 +1101,12 @@ function wireShell() {
 function onKeyboard(event) {
   if (event.defaultPrevented) return;
 
+  if (event.key === "Escape" && reviewPanel?.hasPreview()) {
+    event.preventDefault();
+    reviewPanel.clearPreview();
+    return;
+  }
+
   if (event.key === "Escape" && app.pendingPromotion) {
     event.preventDefault();
     cancelPromotion();
@@ -1047,6 +1117,14 @@ function onKeyboard(event) {
   const target = event.target;
   if (target && target.closest && target.closest("input, textarea, select, [contenteditable='true']")) return;
   if (event.ctrlKey || event.metaKey || event.altKey) return;
+
+  const keyMoment = event.key === "k" || event.key === "K" || event.key === " ";
+  if (keyMoment && app.activeTab === "review" && reviewPanel?.report) {
+    if (event.key === " " && target?.closest?.("button, a, [role='button']")) return;
+    event.preventDefault();
+    reviewPanel.jumpKeyMoment(event.shiftKey ? -1 : 1);
+    return;
+  }
 
   switch (event.key) {
     case "ArrowLeft":

@@ -56,7 +56,7 @@ _ANALYSIS_DEFAULTS = {
 class ChessMasterApi:
     """The object exposed to JavaScript as ``window.pywebview.api``."""
 
-    PHASE = 3
+    PHASE = 4
 
     def __init__(
         self,

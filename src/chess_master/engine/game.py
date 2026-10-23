@@ -497,7 +497,7 @@ class GameSession:
 
         return {
             "schema_version": 1,
-            "phase": 3,
+            "phase": 4,
             "app_version": __version__,
             "game_id": self._game_id,
             "revision": self.revision,

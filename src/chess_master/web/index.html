@@ -9,6 +9,10 @@
       content="Chess Master — a precision chess desktop studio with a native Python bridge, Stockfish 400–3000 Elo and live evaluation."
     />
     <title>Chess Master — Precision Play</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23080b0f'/%3E%3Cpath d='M20 49h25l-2-7H31l4-8 6 5 4-4-7-7 2-9-6-3-8 9-7 2 1 7 7-1-4 8-3 8z' fill='%235fd7a4'/%3E%3C/svg%3E"
+    />
     <link rel="stylesheet" href="assets/vendor/chessground/chessground.base.css" />
     <link rel="stylesheet" href="assets/vendor/chessground/chessground.cburnett.css" />
     <link rel="stylesheet" href="assets/css/app.css" />
@@ -128,6 +132,13 @@
           <circle cx="12" cy="12" r="9" />
           <path d="M12 7v5l3 2" />
         </symbol>
+        <symbol id="i-book" viewBox="0 0 24 24">
+          <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5Z" />
+          <path d="M4 5.5v15A2.5 2.5 0 0 0 6.5 23H20" />
+        </symbol>
+        <symbol id="i-pause" viewBox="0 0 24 24">
+          <path d="M10 5v14M14 5v14" />
+        </symbol>
       </defs>
     </svg>
 
@@ -190,7 +201,7 @@
                 <span class="nav-label">Game Review</span>
                 <span class="nav-sub">Accuracy &amp; turning points</span>
               </span>
-              <span class="nav-tail"><span class="nav-badge">Phase 3</span></span>
+              <span class="nav-tail"><span class="nav-badge">Phase 4</span></span>
             </button>
           </section>
         </nav>
@@ -218,7 +229,7 @@
             <svg class="icon"><use href="#i-cpu" /></svg>
             <span>Engine setup</span>
           </button>
-          <span class="version" id="app-version">v0.2.0 · Phase 2</span>
+          <span class="version" id="app-version">v1.0.0 · Phase 4</span>
         </div>
       </aside>
 
@@ -391,6 +402,8 @@
             <span class="hint-dot"></span>
             <span><kbd class="kbd kbd-tiny">F</kbd> flip</span>
             <span class="hint-dot"></span>
+            <span><kbd class="kbd kbd-tiny">K</kbd> key moment</span>
+            <span class="hint-dot"></span>
             <span><kbd class="kbd kbd-tiny">I</kbd> import</span>
           </div>
           <div class="bridge-state" id="bridge-state">
@@ -437,7 +450,7 @@
             tabindex="-1"
           >
             <span>Review</span>
-            <span class="tab-count tab-count-warm">P3</span>
+            <span class="tab-count tab-count-warm">P4</span>
           </button>
           <span class="tab-ink" id="tab-ink" aria-hidden="true"></span>
         </div>
@@ -492,6 +505,18 @@
                 </div>
               </div>
               <span class="position-result" id="position-result">*</span>
+            </div>
+
+            <div class="review-cta" id="review-cta" hidden>
+              <span class="review-cta-icon"><svg class="icon"><use href="#i-scan" /></svg></span>
+              <div class="review-cta-copy">
+                <strong id="review-cta-title">Game complete</strong>
+                <span id="review-cta-copy-text">See where the game turned.</span>
+              </div>
+              <button type="button" class="btn btn-primary btn-compact" id="btn-review-cta">
+                <svg class="icon"><use href="#i-sparkles" /></svg>
+                <span id="btn-review-cta-label">Analyze in Game Review</span>
+              </button>
             </div>
 
             <div class="branch-note" id="branch-note" hidden>
@@ -656,49 +681,154 @@
               </div>
             </div>
 
-            <div class="review-stats">
-              <div class="review-stat">
-                <span class="review-stat-label">Accuracy</span>
-                <strong class="review-stat-value" id="review-accuracy">—</strong>
-                <span class="review-stat-unit">white · black</span>
+            <div class="review-dashboard" id="review-dashboard" hidden>
+              <div class="review-dashboard-bar">
+                <div class="review-dashboard-meta">
+                  <span class="review-dashboard-preset" id="review-dashboard-preset">Standard · depth 14</span>
+                  <span class="review-dashboard-sub" id="review-dashboard-sub">0 plies</span>
+                </div>
+                <div class="review-dashboard-actions">
+                  <div class="review-presets review-presets-compact" id="review-presets-compact" role="group" aria-label="Review strength">
+                    <button type="button" class="review-preset" data-review-preset="fast" title="Fast review">
+                      <strong>Fast</strong>
+                    </button>
+                    <button type="button" class="review-preset is-active" data-review-preset="standard" aria-pressed="true" title="Standard review">
+                      <strong>Std</strong>
+                    </button>
+                    <button type="button" class="review-preset" data-review-preset="deep" title="Deep review">
+                      <strong>Deep</strong>
+                    </button>
+                  </div>
+                  <button type="button" class="btn btn-quiet btn-compact" id="btn-review-again">
+                    <svg class="icon"><use href="#i-reset" /></svg>
+                    <span>Review again</span>
+                  </button>
+                </div>
               </div>
-              <div class="review-stat">
-                <span class="review-stat-label">ACPL</span>
-                <strong class="review-stat-value" id="review-acpl">—</strong>
-                <span class="review-stat-unit">avg. centipawn loss</span>
-              </div>
-              <div class="review-stat">
-                <span class="review-stat-label">Estimated Elo</span>
-                <strong class="review-stat-value" id="review-elo">—</strong>
-                <span class="review-stat-unit">single-game estimate</span>
-              </div>
-            </div>
 
-            <div class="review-opening" id="review-opening" hidden>
-              <span class="review-opening-eco" id="review-opening-eco">—</span>
-              <div class="review-opening-copy">
-                <strong id="review-opening-name">—</strong>
-                <span id="review-opening-meta">—</span>
+              <div class="review-opening" id="review-opening" hidden>
+                <span class="review-opening-eco" id="review-opening-eco">—</span>
+                <div class="review-opening-copy">
+                  <strong id="review-opening-name">—</strong>
+                  <span id="review-opening-meta">—</span>
+                </div>
               </div>
-            </div>
 
-            <div class="review-counts" id="review-counts" hidden></div>
+              <section class="review-card review-chart-card" aria-labelledby="review-chart-title">
+                <header class="review-card-head">
+                  <div>
+                    <p class="eyebrow">Advantage</p>
+                    <h3 id="review-chart-title">Evaluation curve</h3>
+                  </div>
+                  <div class="review-chart-legend" aria-hidden="true">
+                    <span><i class="legend-swatch legend-white"></i>White</span>
+                    <span><i class="legend-swatch legend-black"></i>Black</span>
+                  </div>
+                </header>
+                <div class="review-chart-wrap" id="review-chart-wrap">
+                  <svg
+                    id="review-chart"
+                    class="review-chart"
+                    viewBox="0 0 320 140"
+                    preserveAspectRatio="none"
+                    role="img"
+                    aria-label="Advantage curve. Click a point or use the left and right arrows to step through moves."
+                    tabindex="0"
+                  ></svg>
+                  <div class="review-chart-tooltip" id="review-chart-tooltip" hidden></div>
+                </div>
+                <div class="review-chart-foot">
+                  <span id="review-chart-ply">Starting position</span>
+                  <span class="review-chart-value" id="review-chart-eval">—</span>
+                </div>
+              </section>
 
-            <div class="review-moves" id="review-moves" hidden>
-              <div class="review-moves-head">
-                <span>Move</span>
-                <span>Grade</span>
-                <span class="review-moves-loss">Win% loss</span>
+              <section class="review-coach" id="review-coach" aria-live="polite">
+                <div class="coach-head">
+                  <div class="coach-move-line">
+                    <span class="coach-number" id="coach-number">—</span>
+                    <strong class="coach-san" id="coach-san">Starting position</strong>
+                    <span class="coach-pill" id="coach-pill" hidden>Best</span>
+                    <span class="coach-forced" id="coach-forced" hidden>Forced</span>
+                  </div>
+                  <div class="coach-score">
+                    <span class="coach-accuracy" id="coach-accuracy">—</span>
+                    <span class="coach-eval" id="coach-eval">—</span>
+                  </div>
+                </div>
+                <p class="coach-body" id="coach-body">
+                  The starting point. Jump to a turning point with the advantage curve, the key-moment
+                  controls, or K.
+                </p>
+                <p class="coach-best" id="coach-best" hidden></p>
+                <div class="coach-actions">
+                  <button type="button" class="btn btn-quiet btn-compact" id="btn-show-followup" hidden>
+                    <svg class="icon"><use href="#i-chevron-right" /></svg>
+                    <span>Show Follow-Up</span>
+                  </button>
+                  <div class="pv-controls" id="pv-controls" hidden>
+                    <button type="button" class="pv-btn" data-pv="prev" title="Previous continuation move">← Step</button>
+                    <span class="pv-progress" id="pv-progress">0 of 0</span>
+                    <button type="button" class="pv-btn" data-pv="next" title="Next continuation move">Step →</button>
+                    <button type="button" class="pv-btn pv-btn-play" data-pv="play" id="pv-play">Play Line</button>
+                    <button type="button" class="pv-btn pv-btn-exit" data-pv="exit" id="pv-exit">Back to Game</button>
+                  </div>
+                </div>
+                <div class="pv-banner" id="pv-banner" hidden></div>
+              </section>
+
+              <div class="review-keymoments" id="review-keymoments" aria-label="Key moment navigation">
+                <button type="button" class="keymoment-btn" id="btn-prev-key">
+                  <svg class="icon"><use href="#i-chevron-left" /></svg>
+                  <span>Prev key moment</span>
+                </button>
+                <span class="keymoment-count" id="keymoment-count">0 / 0</span>
+                <button type="button" class="keymoment-btn" id="btn-next-key">
+                  <span>Next key moment</span>
+                  <svg class="icon"><use href="#i-chevron-right" /></svg>
+                  <kbd class="kbd kbd-tiny">K</kbd>
+                </button>
               </div>
-              <div class="review-move-list" id="review-move-list"></div>
-            </div>
 
-            <div class="review-note" id="review-note" hidden>
-              <svg class="icon"><use href="#i-info" /></svg>
-              <p id="review-note-copy">
-                Reviews run on the shared Stockfish worker. Nothing is graded while a review is running
-                unless you cancel it.
-              </p>
+              <div class="review-players" id="review-players" aria-label="Player summaries"></div>
+
+              <section class="review-card review-matrix-card" aria-labelledby="review-matrix-title">
+                <header class="review-card-head">
+                  <div>
+                    <p class="eyebrow">Breakdown</p>
+                    <h3 id="review-matrix-title">Classification matrix</h3>
+                  </div>
+                  <span class="review-card-hint">Click a row to jump</span>
+                </header>
+                <div class="review-matrix-head" aria-hidden="true">
+                  <span>White</span>
+                  <span>Tier</span>
+                  <span>Black</span>
+                </div>
+                <div class="review-matrix" id="review-matrix"></div>
+              </section>
+
+              <div class="review-move-filter" id="review-move-filter" hidden>
+                <span id="review-filter-label"></span>
+                <button type="button" class="text-button" id="review-filter-clear">Clear filter</button>
+              </div>
+
+              <div class="review-moves" id="review-moves" hidden>
+                <div class="review-moves-head">
+                  <span>Move</span>
+                  <span>Grade</span>
+                  <span class="review-moves-loss">Win% loss</span>
+                </div>
+                <div class="review-move-list" id="review-move-list"></div>
+              </div>
+
+              <div class="review-note" id="review-note" hidden>
+                <svg class="icon"><use href="#i-info" /></svg>
+                <p id="review-note-copy">
+                  Reviews run on the shared Stockfish worker. Nothing is graded while a review is running
+                  unless you cancel it.
+                </p>
+              </div>
             </div>
           </section>
         </div>

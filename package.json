@@ -1,6 +1,6 @@
 {
   "name": "chess-master-ui",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "description": "Build tooling for the Chess Master web UI (Tailwind v4 + Chessground + chess.js).",
