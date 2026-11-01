@@ -1,8 +1,8 @@
 # Third-Party Notices
 
-Chess Master 0.1.0 includes or depends on the following third-party work. The
+Chess Master 1.0.0 includes or depends on the following third-party work. The
 full license texts that are distributed with source files are kept beside those
-files; paths are listed below. Versions reflect the Phase 1 lockfiles.
+files; paths are listed below. Versions reflect the current lockfiles.
 
 ## Bundled frontend libraries
 

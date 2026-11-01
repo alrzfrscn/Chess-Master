@@ -126,8 +126,8 @@ class ReviewRequest:
             raise ValueError("A review needs at least one move.")
         if self.depth is not None:
             depth = int(self.depth)
-            if depth < 6 or depth > 24:
-                raise ValueError("Review depth must be between 6 and 24.")
+            if depth < 6 or depth > CONFIRM_DEPTH_CAP:
+                raise ValueError(f"Review depth must be between 6 and {CONFIRM_DEPTH_CAP}.")
         for value in (self.baseline_white, self.baseline_black):
             if value is not None and (int(value) < 400 or int(value) > 3000):
                 raise ValueError("Estimated-Elo baselines must be between 400 and 3000.")
@@ -146,6 +146,8 @@ class ReviewRequest:
 
     @property
     def confirm_depth(self) -> int:
+        if self.depth is None:
+            return int(REVIEW_PRESETS[self.preset]["confirm_depth"])
         return min(self.base_depth + CONFIRM_DEPTH_BONUS, CONFIRM_DEPTH_CAP)
 
     @property
@@ -764,6 +766,10 @@ def run_game_review(
     # graded move.
     needed_positions = list(range(last_book_ply, total_plies + 1)) if graded_plies else []
     progress = _Progress(len(needed_positions) or 1, on_progress)
+    if not needed_positions:
+        # A 100% book game has nothing to search; report completion at once.
+        progress.done = progress.total = 1
+        progress.phase = "complete"
     progress.emit()
 
     evals: dict[int, _PositionEval] = {}

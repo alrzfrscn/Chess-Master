@@ -7,6 +7,7 @@ import pytest
 
 from chess_master.analysis.review import (
     REVIEW_MULTIPV,
+    REVIEW_SCHEMA_VERSION,
     ReviewCancelled,
     ReviewRequest,
     ReviewSearchResult,
@@ -60,7 +61,7 @@ def test_pipeline_grades_every_non_book_ply_and_builds_the_report() -> None:
         on_progress=progress.append,
     )
 
-    assert report["schema_version"] == 2
+    assert report["schema_version"] == REVIEW_SCHEMA_VERSION
     assert report["phase"] == 4
     assert report["status"] == "complete"
     assert report["game_id"] == "contract"
@@ -444,3 +445,47 @@ def test_cancellation_stops_before_the_next_search() -> None:
         )
 
     assert len(calls) == 1
+
+
+def test_review_request_rejects_depth_above_the_confirmation_cap() -> None:
+    with pytest.raises(ValueError):
+        ReviewRequest(
+            game_id="too-deep",
+            start_fen=chess.STARTING_FEN,
+            moves=("e2e4",),
+            depth=20,
+        )
+
+
+def test_depth_at_the_cap_skips_confirmation_and_leaves_candidates_unconfirmed() -> None:
+    start = "6k1/8/6p1/8/8/8/8/3Q2K1 w - - 0 1"
+    positions = _fen_sequence(start, ("d1h5",))
+
+    def search(board: chess.Board, depth: int, multipv: int) -> ReviewSearchResult:
+        cp = 300 if board.fen() == positions[0] else 150
+        uci = "d1h5" if board.fen() == positions[0] else None
+        return ReviewSearchResult(
+            lines=[{"rank": 1, "uci": uci, "score_cp": cp}],
+            depth=depth,
+            time_ms=4,
+        )
+
+    request = ReviewRequest(
+        game_id="cap",
+        start_fen=start,
+        moves=("d1h5",),
+        depth=18,
+        use_book=False,
+    )
+
+    assert request.base_depth == 18
+    assert request.confirm_depth == 18
+    assert request.confirm_depth >= request.base_depth
+
+    report = run_game_review(request, search)
+
+    assert report["schema_version"] == REVIEW_SCHEMA_VERSION
+    assert report["engine"]["confirm_depth"] == request.confirm_depth
+    candidates = [move for move in report["moves"] if move["needs_confirmation"]]
+    assert candidates
+    assert all(move["confirmed"] is False for move in candidates)

@@ -135,6 +135,31 @@ class EngineCoordinator:
 
         token = self.token_for(session)
         self._invalidate_review_if_needed(session)
+        self._apply_sync_options(
+            analysis_enabled=analysis_enabled,
+            arrows=arrows,
+            depth=depth,
+            multipv=multipv,
+        )
+        self._apply_sync_token(token)
+        self._worker.set_active_token(token)
+        if self._review_is_running():
+            if self._is_bot_turn(session):
+                # The bot must keep playing; a review is a background task.
+                self.cancel_game_review(session, reason="bot_turn")
+            else:
+                # Live analysis would queue behind a multi-minute review.
+                return
+        self.ensure_scheduled(session)
+
+    def _apply_sync_options(
+        self,
+        *,
+        analysis_enabled: bool | None,
+        arrows: bool | None,
+        depth: int | None,
+        multipv: int | None,
+    ) -> None:
         with self._lock:
             old_depth = int(self._options["depth"])
             old_multipv = int(self._options["multipv"])
@@ -156,17 +181,11 @@ class EngineCoordinator:
             ):
                 self._analysis = None
                 self._analysis_scheduled = None
+
+    def _apply_sync_token(self, token: EngineToken) -> None:
+        with self._lock:
             if token != self._token:
                 self._reset_for(token)
-        self._worker.set_active_token(token)
-        if self._review_is_running():
-            if self._is_bot_turn(session):
-                # The bot must keep playing; a review is a background task.
-                self.cancel_game_review(session, reason="bot_turn")
-            else:
-                # Live analysis would queue behind a multi-minute review.
-                return
-        self.ensure_scheduled(session)
 
     def ensure_scheduled(self, session: "GameSession") -> None:
         """Queue missing jobs.  Idempotent; safe to call on every poll."""
@@ -690,6 +709,7 @@ class EngineCoordinator:
                 logger.debug("Discarded stale bot move for revision %s", token.revision)
 
     def _on_error(self, message: str) -> None:
+        cancel_review = False
         with self._lock:
             self._last_error = message
             self._thinking = False
@@ -705,6 +725,9 @@ class EngineCoordinator:
                         },
                     }
                 )
+                cancel_review = True
+        if cancel_review:
+            self._worker.cancel_review()
 
     def _on_review_progress(self, payload: dict[str, Any]) -> None:
         self._apply_review_progress(payload)

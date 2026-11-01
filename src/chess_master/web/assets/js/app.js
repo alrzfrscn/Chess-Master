@@ -120,7 +120,7 @@ function renderAll() {
   renderEngineStrip();
 
   panel.setGame(game);
-  panel.refreshExport();
+  if (app.activeTab === "import") panel.refreshExport();
   reviewPanel?.setGame(game);
   reviewPanel?.update(game.review);
   syncArrows();

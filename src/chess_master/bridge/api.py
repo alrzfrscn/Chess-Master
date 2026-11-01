@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from chess_master import __version__
-from chess_master.analysis.review import REVIEW_PRESETS
+from chess_master.analysis.review import CONFIRM_DEPTH_CAP, REVIEW_PRESETS
 from chess_master.analysis.winprob import model_info
 from chess_master.engine.coordinator import EngineCoordinator
 from chess_master.engine.errors import ChessMasterError, InvalidInputError
@@ -359,8 +359,10 @@ class ChessMasterApi:
                     depth = int(depth)
                 except (TypeError, ValueError) as exc:
                     raise InvalidInputError("Review depth must be a whole number.") from exc
-                if depth < 6 or depth > 24:
-                    raise InvalidInputError("Review depth must be from 6 to 24.")
+                if depth < 6 or depth > CONFIRM_DEPTH_CAP:
+                    raise InvalidInputError(
+                        f"Review depth must be from 6 to {CONFIRM_DEPTH_CAP}."
+                    )
             force = bool(incoming.get("force", False))
             use_book = incoming.get("use_book", True)
             if not isinstance(use_book, bool):

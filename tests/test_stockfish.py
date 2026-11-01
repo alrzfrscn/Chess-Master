@@ -13,6 +13,7 @@ from chess_master.engine.stockfish import (
     ELO_PRESETS,
     AnalysisCache,
     EngineToken,
+    StockfishManager,
     analysis_payload_from_infos,
     discover_engine,
     elo_profile,
@@ -274,3 +275,34 @@ def test_token_round_trip() -> None:
     token = EngineToken("g1", 4, 2, chess.STARTING_FEN)
     assert EngineToken.from_mapping(token.to_dict()) == token
     assert token.to_dict()["revision"] == 4
+
+
+def test_cache_get_at_least_prefers_the_exact_depth() -> None:
+    cache = AnalysisCache()
+    fen = chess.STARTING_FEN
+    cache.put(fen, 12, {"depth": 12, "multipv": 3})
+    cache.put(fen, 18, {"depth": 18, "multipv": 3})
+
+    exact = cache.get_at_least(fen, 12, 3)
+    assert exact is not None
+    assert exact["depth"] == 12
+
+    deeper = cache.get_at_least(fen, 14, 3)
+    assert deeper is not None
+    assert deeper["depth"] == 18
+
+
+def test_close_engine_forces_shutdown_when_quit_fails() -> None:
+    class HungEngine:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def quit(self) -> None:
+            raise RuntimeError("hung")
+
+        def close(self) -> None:
+            self.closed = True
+
+    engine = HungEngine()
+    StockfishManager._close_engine(engine, timeout=0.5)
+    assert engine.closed is True

@@ -781,11 +781,16 @@ class AnalysisCache:
         wanted_depth = int(depth)
         wanted_multipv = int(multipv)
         with self._lock:
+            exact = self._data.get((normalized, wanted_depth))
+            if exact is not None and int(exact.get("multipv", 0)) >= wanted_multipv:
+                self._data.move_to_end((normalized, wanted_depth))
+                self._hits += 1
+                return copy.deepcopy(exact)
             candidates = [
                 key[1]
                 for key, payload in self._data.items()
                 if key[0] == normalized
-                and key[1] >= wanted_depth
+                and key[1] > wanted_depth
                 and int(payload.get("multipv", 0)) >= wanted_multipv
             ]
             if not candidates:
@@ -998,8 +1003,12 @@ class StockfishManager:
             thread.join(timeout=timeout)
         self._thread = None
         with self._lock:
+            engine = self._engine
             self._engine = None
             self._status = "ready" if self.available else "missing"
+        if engine is not None:
+            # The worker may be stuck inside quit(); force the transport down.
+            self._close_engine(engine)
 
     def configure_path(self, path: str | os.PathLike[str] | None) -> dict[str, Any]:
         """Replace the binary.  The next job lazily starts the new process."""
@@ -1256,6 +1265,55 @@ class StockfishManager:
     def _default_engine_factory(path: str) -> Any:
         return chess.engine.SimpleEngine.popen_uci(path, timeout=10.0)
 
+    @staticmethod
+    def _close_engine(engine: Any, timeout: float = 2.0) -> None:
+        """Quit an engine, force-closing its transport if quit fails or hangs."""
+
+        if engine is None:
+            return
+
+        quit_ok = False
+
+        def quit_engine() -> None:
+            nonlocal quit_ok
+            try:
+                engine.quit()
+                quit_ok = True
+            except Exception:
+                logger.debug("Stockfish did not quit cleanly", exc_info=True)
+
+        quitter = threading.Thread(
+            target=quit_engine, name="chess-master-engine-quit", daemon=True
+        )
+        quitter.start()
+        quitter.join(max(0.0, timeout))
+        if quit_ok:
+            return
+
+        logger.warning("Stockfish did not quit; terminating its transport")
+        protocol = getattr(engine, "protocol", None)
+        targets = [
+            getattr(protocol, "transport", None),
+            getattr(engine, "process", None),
+        ]
+        if all(target is None for target in targets):
+            # No raw transport to kill; fall back to the engine's own close.
+            targets.append(getattr(engine, "close", None))
+        for target in targets:
+            if target is None:
+                continue
+            try:
+                if callable(target):
+                    target()
+                else:
+                    for action in ("close", "kill", "terminate"):
+                        method = getattr(target, action, None)
+                        if callable(method):
+                            method()
+                            break
+            except Exception:
+                logger.debug("Forced engine shutdown step failed", exc_info=True)
+
     def _handle_failure(self, exc: Exception) -> None:
         logger.warning("Stockfish job failed: %s", exc, exc_info=True)
         with self._lock:
@@ -1265,11 +1323,8 @@ class StockfishManager:
             engine = self._engine
             self._engine = None
             self._current_analysis = None
-        if engine is not None:
-            try:
-                engine.quit()
-            except Exception:
-                pass
+            self._current_job = None
+        self._close_engine(engine)
         self._emit_error(self._message)
 
     def _job_is_current(self, job: EngineJob) -> bool:
@@ -1391,6 +1446,8 @@ class StockfishManager:
             return
         if job.use_cache:
             self._cache.put(job.token.fen, job.depth, payload)
+        if not self._job_is_current(job):
+            return
         self._emit_analysis(job.token, payload)
 
     def _run_bot(self, engine: Any, job: EngineJob) -> None:

@@ -270,7 +270,7 @@ to the game state and uses `REVIEW_SCHEMA_VERSION = 2`:
 | `timing`, `opening`, `totals` | Searches, cache hits, elapsed time, ECO/name, graded/confirmed counts |
 
 Presets are **Fast** (depth 10 base, 12 confirm), **Standard** (14/16) and
-**Deep** (18/20). Book moves are detected from the bundled opening data and can
+**Deep** (16/18). Book moves are detected from the bundled opening data and can
 be skipped with `use_book=false`.
 
 ### Development HTTP transport

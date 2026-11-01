@@ -430,6 +430,7 @@ export class ReviewPanel {
      Advantage chart
      -------------------------------------------------------------------- */
 
+  // Exact ply match first; otherwise fall back to the clamped index.
   pointAtPly(ply) {
     const points = this.report?.eval_chart?.points || [];
     if (!points.length) return null;
@@ -1199,7 +1200,7 @@ export class ReviewPanel {
 
     const arrows = [];
     const best = move.best_move;
-    if (best?.from && best?.to && best.uci !== move.uci && !move.is_book) {
+    if (best?.from && best?.to && best.uci && best.uci !== move.uci && !move.is_book) {
       arrows.push({ orig: best.from, dest: best.to, brush: "alternative" });
     }
     if (move.from && move.to) {

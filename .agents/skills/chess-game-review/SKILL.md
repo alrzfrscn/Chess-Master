@@ -458,7 +458,7 @@ merely because the game is short.
 The API is versioned separately from the review report:
 
 - Game state `schema_version`: 1
-- Review report `schema_version`: 1, `phase`: 3
+- Review report `schema_version`: 2, `phase`: 4
 - API metadata `schema_version`: 3
 
 ### Review methods
@@ -471,7 +471,7 @@ get_game_review(full=True)
 
 `preset` is `fast`, `standard` or `deep`. Options:
 
-- `depth`: optional integer 6–24 (confirmation is `depth + 2`, capped 18)
+- `depth`: optional integer 6–18 (confirmation is `depth + 2`, capped 18)
 - `use_book`: default true; false grades the opening too (tests/debugging)
 - `force`: default false; true starts a fresh run even if the same line and
   preset already completed
@@ -490,7 +490,7 @@ get_game_review(full=True)
 ```json
 {
   "review": { "status": "complete", "summary": {...}, "opening": {...} },
-  "report": { "schema_version": 1, "phase": 3, "moves": [...] }
+  "report": { "schema_version": 2, "phase": 4, "moves": [...] }
 }
 ```
 
@@ -517,8 +517,8 @@ On `complete`, the full report is available through `get_game_review`.
 ```json
 {
   "available": true,
-  "schema_version": 1,
-  "phase": 3,
+  "schema_version": 2,
+  "phase": 4,
   "status": "complete",
   "game_id": "...",
   "signature": "...",
