@@ -44,14 +44,27 @@ def _set_windows_app_id() -> None:
         logger.debug("Could not set the Windows app id", exc_info=True)
 
 
-def run_server(port: int = 8765, *, engine_path: str | None = None) -> int:
+def run_server(
+    port: int = 8765,
+    *,
+    engine_path: str | None = None,
+    lan: bool = False,
+) -> int:
     """Run the UI + development HTTP API headlessly (used by verification)."""
 
     api = ChessMasterApi(engine_path=engine_path)
     server = WebAppServer(WEB_ROOT, api, port=port, expose_api=True)
+    api._attach_server(server)
+    if lan:
+        api.set_lan_mode(True)
     try:
         server.start()
         print(f"Chess Master dev server: {server.url}", flush=True)
+        info = api.get_lan_info().get("data") or {}
+        if info.get("enabled") and info.get("lan_url"):
+            print(f"LAN play (Pass & Play): {info['lan_url']}?seat=both", flush=True)
+            print(f"LAN play (White):       {info['seat_urls']['white']}", flush=True)
+            print(f"LAN play (Black):       {info['seat_urls']['black']}", flush=True)
         print("Press Ctrl+C to stop.", flush=True)
         # Keep the main thread alive; the HTTP server owns a daemon thread.
         while True:
@@ -70,6 +83,7 @@ def run_app(
     http_api: bool = False,
     smoke_test: bool = False,
     engine_path: str | None = None,
+    lan: bool = False,
 ) -> int:
     """Launch the desktop window. Imports PyWebView lazily for headless use."""
 
@@ -85,6 +99,9 @@ def run_app(
 
     api = ChessMasterApi(engine_path=engine_path)
     server = WebAppServer(WEB_ROOT, api, expose_api=http_api)
+    api._attach_server(server)
+    if lan:
+        api.set_lan_mode(True)
     try:
         server.start()
         window = webview.create_window(
@@ -143,6 +160,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Run the web UI and development API without opening a desktop window.",
     )
     parser.add_argument(
+        "--lan",
+        action="store_true",
+        help="Share the UI with phones on the same Wi-Fi network (binds 0.0.0.0).",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=None,
@@ -167,12 +189,13 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.serve:
-        return run_server(args.port or 8765, engine_path=args.engine)
+        return run_server(args.port or 8765, engine_path=args.engine, lan=args.lan)
     return run_app(
         debug=args.debug,
         http_api=args.http_api,
         smoke_test=args.smoke_test,
         engine_path=args.engine,
+        lan=args.lan,
     )
 
 

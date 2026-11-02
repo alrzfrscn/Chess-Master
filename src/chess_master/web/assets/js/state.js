@@ -2,11 +2,16 @@
 
 import { Chess } from "../vendor/chess.js/chess.js";
 
+export const SEAT_VALUES = ["both", "white", "black", "spectator"];
+
+const requestedSeat = new URLSearchParams(window.location.search).get("seat") || "both";
+
 export const app = {
   game: null,
   apiInfo: null,
   samples: [],
   orientation: "white",
+  seat: SEAT_VALUES.includes(requestedSeat) ? requestedSeat : "both",
   evalVisible: true,
   arrowsEnabled: false,
   evaluation: null,
@@ -14,6 +19,7 @@ export const app = {
   activeTab: "moves",
   preview: null,
   bridgeMode: null,
+  lan: null,
   busy: false,
   navigating: false,
   pendingPromotion: null,
@@ -95,9 +101,12 @@ export function modeTitle(game) {
   return "Pass & Play";
 }
 
-/** In an engine game the human may only move on their own turn. */
+/** In an engine game the human may only move on their own turn, and a device
+ * that holds a seat only moves for that colour. */
 export function canHumanMove(game) {
   if (!game || !game.status || game.status.state !== "in_progress") return false;
+  if (app.seat === "spectator") return false;
+  if (app.seat !== "both" && game.turn !== app.seat) return false;
   if (game.mode !== "stockfish") return true;
   const bot = game.engine && game.engine.bot_color;
   return !bot || game.turn !== bot;

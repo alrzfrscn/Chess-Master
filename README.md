@@ -103,6 +103,25 @@ Open <http://127.0.0.1:8765/>. The HTTP API is deliberately disabled unless
 `--serve` or `--http-api` is used; the desktop window talks to Python through the
 PyWebView bridge instead.
 
+### LAN / mobile play
+
+Phones on the same Wi-Fi can open the table in their browsers. Turn on **LAN /
+Mobile Play** in the sidebar (or start with `--lan`) and open one of the printed
+links on each phone:
+
+```powershell
+.\.venv\Scripts\python.exe -m chess_master --lan          # desktop + LAN
+.\.venv\Scripts\python.exe -m chess_master --lan --serve  # headless + LAN
+```
+
+- `?seat=both` — pass & play on that phone, `?seat=white` — White only,
+  `?seat=black` — Black only, `?seat=spectator` — view only.
+- Seats lock dragging to that colour and orient the board for it; the header
+  seat selector switches the current device without reloading.
+- Every device polls the same authoritative game, so moves, navigation and Game
+  Review stay in sync. Allow Chess Master on **Private networks** when Windows
+  Firewall asks.
+
 ### Build and test
 
 ```powershell

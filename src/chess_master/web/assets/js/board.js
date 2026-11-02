@@ -124,7 +124,7 @@ export class BoardController {
   }
 
   handleDrop(from, to) {
-    if (!this.game || this.pendingPromotion) return;
+    if (!this.game || !this.canPlay || this.pendingPromotion) return;
 
     if (isPromotion(this.game.fen, from, to)) {
       const color = this.game.turn;

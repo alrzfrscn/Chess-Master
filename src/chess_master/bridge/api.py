@@ -24,6 +24,7 @@ from typing import Any, Callable
 from chess_master import __version__
 from chess_master.analysis.review import CONFIRM_DEPTH_CAP, REVIEW_PRESETS
 from chess_master.analysis.winprob import model_info
+from chess_master.bridge.lan import local_ipv4
 from chess_master.engine.coordinator import EngineCoordinator
 from chess_master.engine.errors import ChessMasterError, InvalidInputError
 from chess_master.engine.game import (
@@ -68,6 +69,8 @@ class ChessMasterApi:
         self._session = GameSession.new_game("pass_play")
         self._analysis_options = dict(_ANALYSIS_DEFAULTS)
         self._polling_started = False
+        self._server: Any = None
+        self._lan_enabled = False
         self._engine = EngineCoordinator(path=engine_path, worker=worker)
         self._engine.bind(self._session)
 
@@ -407,6 +410,54 @@ class ChessMasterApi:
 
         return self._execute(operation)
 
+    # -- LAN / multi-device ---------------------------------------------
+    def _attach_server(self, server: Any) -> None:
+        """Link the asset server so LAN mode can expose it to the Wi-Fi network."""
+
+        self._server = server
+
+    def _lan_payload(self) -> dict[str, Any]:
+        server = self._server
+        host = str(getattr(server, "host", "127.0.0.1"))
+        port = int(getattr(server, "port", 0))
+        address = local_ipv4()
+        base = f"http://{address}:{port}" if address and port else None
+        seats = ("both", "white", "black", "spectator")
+        return {
+            "enabled": bool(self._lan_enabled and server is not None),
+            "host": host,
+            "port": port,
+            "lan_ip": address,
+            "lan_url": f"{base}/" if base else None,
+            "seat_urls": {seat: (f"{base}/?seat={seat}" if base else None) for seat in seats},
+        }
+
+    def set_lan_mode(self, enabled: bool = True) -> dict[str, Any]:
+        """Expose the UI and HTTP API to phones on the same Wi-Fi network."""
+
+        def operation() -> dict[str, Any]:
+            if not isinstance(enabled, bool):
+                raise InvalidInputError("LAN mode must be true or false.")
+            if self._server is None:
+                raise InvalidInputError("LAN sharing is unavailable because no web server is attached.")
+            try:
+                self._server.rebind("0.0.0.0" if enabled else "127.0.0.1")
+            except OSError as exc:
+                raise InvalidInputError(
+                    "The web server could not move to the network interface.",
+                    details={"reason": str(exc)},
+                ) from exc
+            self._server.lan_enabled = enabled
+            self._lan_enabled = enabled
+            return self._lan_payload()
+
+        return self._execute(operation)
+
+    def get_lan_info(self) -> dict[str, Any]:
+        """Return LAN reachability and one join URL per device seat."""
+
+        return self._execute(self._lan_payload)
+
     # -- metadata --------------------------------------------------------
     def get_api_info(self) -> dict[str, Any]:
         """Describe the bridge, its phase and the approved analysis model."""
@@ -436,6 +487,8 @@ class ChessMasterApi:
                     "start_game_review",
                     "cancel_game_review",
                     "get_game_review",
+                    "get_lan_info",
+                    "set_lan_mode",
                 ],
                 "capabilities": {
                     "pass_and_play": True,
@@ -450,6 +503,8 @@ class ChessMasterApi:
                     "engine_path_config": True,
                     "game_review": True,
                     "review_presets": list(REVIEW_PRESETS),
+                    "lan": True,
+                    "device_seats": ["both", "white", "black", "spectator"],
                 },
                 "analysis": model_info(),
                 "engine": self._engine.engine_payload(self._session),

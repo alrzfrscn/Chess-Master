@@ -27,6 +27,12 @@
           <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
           <path d="M16 3.13a4 4 0 0 1 0 7.75" />
         </symbol>
+        <symbol id="i-wifi" viewBox="0 0 24 24">
+          <path d="M2 8.8a16 16 0 0 1 20 0" />
+          <path d="M5 12.5a11 11 0 0 1 14 0" />
+          <path d="M8.5 16.2a6 6 0 0 1 7 0" />
+          <circle cx="12" cy="20" r="1" />
+        </symbol>
         <symbol id="i-cpu" viewBox="0 0 24 24">
           <rect x="4" y="4" width="16" height="16" rx="2" />
           <rect x="9" y="9" width="6" height="6" />
@@ -203,6 +209,14 @@
               </span>
               <span class="nav-tail"><span class="nav-badge">Phase 4</span></span>
             </button>
+            <button type="button" class="nav-item" id="btn-lan">
+              <span class="nav-icon"><svg class="icon"><use href="#i-wifi" /></svg></span>
+              <span class="nav-copy">
+                <span class="nav-label">LAN / Mobile Play</span>
+                <span class="nav-sub">Phones on this Wi-Fi</span>
+              </span>
+              <span class="nav-tail"><span class="nav-badge nav-badge-live">New</span></span>
+            </button>
           </section>
         </nav>
 
@@ -247,6 +261,19 @@
             </div>
           </div>
           <div class="stage-actions">
+            <button type="button" class="btn btn-quiet btn-lan-mobile" id="btn-lan-mobile" aria-label="LAN / mobile play">
+              <svg class="icon"><use href="#i-wifi" /></svg>
+              <span>LAN</span>
+            </button>
+            <label class="seat-pill" title="This device's seat">
+              <span>Seat</span>
+              <select id="seat-select" class="seat-select" aria-label="This device's seat">
+                <option value="both">Both</option>
+                <option value="white">White</option>
+                <option value="black">Black</option>
+                <option value="spectator">Spectator</option>
+              </select>
+            </label>
             <button type="button" class="btn btn-quiet" id="btn-stage-import">
               <svg class="icon"><use href="#i-upload" /></svg>
               <span>Import</span>
@@ -989,6 +1016,76 @@
           <button type="submit" class="btn btn-primary" id="btn-engine-save">Use engine</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog class="dialog" id="lan-dialog" aria-labelledby="lan-title">
+      <div class="dialog-card">
+        <div class="dialog-head">
+          <div>
+            <p class="eyebrow">Multi-device</p>
+            <h2 id="lan-title">LAN / mobile play</h2>
+          </div>
+          <button type="button" class="icon-btn dialog-close" data-close-dialog aria-label="Close">
+            <svg class="icon"><use href="#i-x" /></svg>
+          </button>
+        </div>
+
+        <div class="lan-share-card">
+          <div class="lan-share-copy">
+            <p>Share this table on your Wi-Fi</p>
+            <span id="lan-status">Sharing is off. The table stays on this computer.</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="lan-toggle" role="switch" aria-label="LAN access" />
+            <span class="switch-track" aria-hidden="true"></span>
+          </label>
+        </div>
+
+        <p class="dialog-note">
+          Open this address on a phone that shares the same Wi-Fi:<br />
+          <code id="lan-url">Turn on LAN access first.</code>
+        </p>
+
+        <div class="lan-links">
+          <div class="lan-link-row">
+            <span class="lan-link-label">Pass &amp; Play</span>
+            <code class="lan-link" data-lan-seat="both">—</code>
+            <button type="button" class="icon-btn" data-copy-seat="both" aria-label="Copy Pass &amp; Play link" disabled>
+              <svg class="icon"><use href="#i-copy" /></svg>
+            </button>
+          </div>
+          <div class="lan-link-row">
+            <span class="lan-link-label">White only</span>
+            <code class="lan-link" data-lan-seat="white">—</code>
+            <button type="button" class="icon-btn" data-copy-seat="white" aria-label="Copy White link" disabled>
+              <svg class="icon"><use href="#i-copy" /></svg>
+            </button>
+          </div>
+          <div class="lan-link-row">
+            <span class="lan-link-label">Black only</span>
+            <code class="lan-link" data-lan-seat="black">—</code>
+            <button type="button" class="icon-btn" data-copy-seat="black" aria-label="Copy Black link" disabled>
+              <svg class="icon"><use href="#i-copy" /></svg>
+            </button>
+          </div>
+          <div class="lan-link-row">
+            <span class="lan-link-label">Spectator</span>
+            <code class="lan-link" data-lan-seat="spectator">—</code>
+            <button type="button" class="icon-btn" data-copy-seat="spectator" aria-label="Copy Spectator link" disabled>
+              <svg class="icon"><use href="#i-copy" /></svg>
+            </button>
+          </div>
+        </div>
+
+        <p class="dialog-note">
+          <strong>Windows Firewall:</strong> allow Chess Master on <em>Private networks</em> the first time.
+          Phones and the laptop must be on the same Wi-Fi; guest networks often block device-to-device traffic.
+        </p>
+
+        <div class="dialog-actions">
+          <button type="button" class="btn btn-quiet" data-close-dialog>Done</button>
+        </div>
+      </div>
     </dialog>
 
     <dialog class="dialog dialog-sm" id="confirm-dialog" aria-labelledby="confirm-title">

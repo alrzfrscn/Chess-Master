@@ -3,7 +3,7 @@
 PyWebView loads the UI from ``http://127.0.0.1:<port>/`` rather than ``file://``
 so ES modules, fetch and fonts behave exactly as they do in a browser. In normal
 desktop use the JS API goes through PyWebView; the HTTP ``/api`` route is only
-enabled for development and headless verification, never in the shipped window.
+enabled for development, headless verification and while LAN mode is on.
 """
 
 from __future__ import annotations
@@ -49,13 +49,41 @@ class WebAppServer:
         self.host = host
         self._requested_port = port
         self.expose_api = expose_api
+        self.lan_enabled = False
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._port = port
 
     @property
+    def port(self) -> int:
+        return self._port
+
+    @property
     def url(self) -> str:
-        return f"http://{self.host}:{self._port}/"
+        # 0.0.0.0 is a bind address, not something a browser can open.
+        host = "127.0.0.1" if self.host in {"", "0.0.0.0"} else self.host
+        return f"http://{host}:{self._port}/"
+
+    def rebind(self, host: str) -> None:
+        """Listen on another interface without changing the port."""
+
+        if host == self.host:
+            return
+        running = self._thread is not None
+        port = self._port
+        previous = self.host
+        self.stop()
+        self.host = host
+        self._requested_port = port
+        if running:
+            try:
+                self.start()
+            except OSError:
+                # Keep serving on the old interface when the new bind fails.
+                self.host = previous
+                self._requested_port = port
+                self.start()
+                raise
 
     def _bind(self) -> ThreadingHTTPServer:
         if self._httpd is None:
@@ -102,7 +130,7 @@ class WebAppServer:
     def _make_handler(self) -> type[BaseHTTPRequestHandler]:
         root = self.web_root
         api = self.api
-        expose_api = self.expose_api
+        owner = self
         allowed_methods = {
             name
             for name in dir(api)
@@ -130,7 +158,7 @@ class WebAppServer:
                         {"ok": False, "data": None, "error": {"code": "not_found", "message": "Unknown route."}},
                     )
                     return
-                if not expose_api:
+                if not (owner.expose_api or owner.lan_enabled):
                     self._send_json(
                         HTTPStatus.NOT_FOUND,
                         {
@@ -138,7 +166,7 @@ class WebAppServer:
                             "data": None,
                             "error": {
                                 "code": "api_disabled",
-                                "message": "The HTTP API is only available in development mode.",
+                                "message": "The HTTP API is only available in development mode or with LAN access on.",
                             },
                         },
                     )

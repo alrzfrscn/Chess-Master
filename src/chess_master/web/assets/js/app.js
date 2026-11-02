@@ -12,11 +12,12 @@ import {
   modeTitle,
   resultLabel,
   resultTone,
+  SEAT_VALUES,
   sessionEvent,
   sourceLabel,
   titleCase,
 } from "./state.js";
-import { askConfirm, closeDialog, openDialog, TabController, toast } from "./ui.js";
+import { askConfirm, closeDialog, copyText, openDialog, TabController, toast } from "./ui.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -29,6 +30,11 @@ const refs = {
   bottomPlayer: $("player-bottom"),
   newGameDialog: $("new-game-dialog"),
   engineDialog: $("engine-dialog"),
+  lanDialog: $("lan-dialog"),
+  lanToggle: $("lan-toggle"),
+  lanStatus: $("lan-status"),
+  lanUrl: $("lan-url"),
+  seatSelect: $("seat-select"),
   confirmDialog: $("confirm-dialog"),
   bootError: $("boot-error"),
   bootErrorMessage: $("boot-error-message"),
@@ -70,6 +76,9 @@ const refs = {
 };
 
 refs.players = { top: refs.topPlayer, bottom: refs.bottomPlayer };
+refs.lanLinks = Object.fromEntries(
+  [...document.querySelectorAll("[data-lan-seat]")].map((el) => [el.dataset.lanSeat, el]),
+);
 
 refs.turnLabel = $("turn-label");
 refs.turnDot = $("turn-dot");
@@ -341,7 +350,7 @@ function applyState(state, { autoOrient = false } = {}) {
   app.game = state;
   app.evaluation = state.evaluation || null;
   app.engine = state.engine || null;
-  if (autoOrient && state.orientation) app.orientation = state.orientation;
+  if (autoOrient && state.orientation && app.seat === "both") app.orientation = state.orientation;
   app.pendingPromotion = null;
   board.clearPromotion();
   hidePromotion();
@@ -429,7 +438,7 @@ function bridgeStatus(status, info = null) {
    -------------------------------------------------------------------------- */
 
 async function playMove(uci) {
-  if (!uci || app.busy) return;
+  if (!uci || app.busy || !canHumanMove(app.game)) return;
   const previous = app.game;
   const branching = Boolean(previous && previous.branch_available);
   if (reviewPanel?.hasPreview()) reviewPanel.clearPreview();
@@ -799,16 +808,25 @@ function pollSoon(delay = 80) {
 
 async function pollEngine() {
   if (!app.game || app.pollBusy || app.busy || app.navigating || app.pendingPromotion) return;
-  if (document.querySelector("dialog[open]")) return;
+  // The LAN dialog stays open while phones play, so it must not pause sync.
+  if (document.querySelector("dialog[open]:not(#lan-dialog)")) return;
   app.pollBusy = true;
   try {
     const result = await call("engine_poll");
     if (!result || !result.state) return;
     const state = result.state;
+    const previous = app.game;
+    const shared = Boolean(
+      previous &&
+        (state.game_id !== previous.game_id ||
+          Number(state.revision) > Number(previous.revision)),
+    );
     const fingerprint = stateFingerprint(state);
-    if (fingerprint !== app.stateFingerprint) {
-      const previous = app.game;
+    if (shared || fingerprint !== app.stateFingerprint) {
       applyState(state);
+      if (shared) {
+        window.dispatchEvent(new CustomEvent("chessmaster:sync", { detail: state }));
+      }
       if (result.moved) {
         announceOutcome(previous, state);
         window.dispatchEvent(new CustomEvent("chessmaster:enginemove", { detail: result.moved }));
@@ -934,6 +952,95 @@ function autoDetectEngine() {
 }
 
 /* --------------------------------------------------------------------------
+   LAN sharing / device seat
+   -------------------------------------------------------------------------- */
+
+function setSeat(value) {
+  if (!SEAT_VALUES.includes(value)) return;
+  app.seat = value;
+  if (value === "white" || value === "black") app.orientation = value;
+  if (refs.seatSelect) refs.seatSelect.value = value;
+  const url = new URL(window.location.href);
+  if (value === "both") url.searchParams.delete("seat");
+  else url.searchParams.set("seat", value);
+  window.history.replaceState(null, "", url);
+  if (app.game) renderAll();
+}
+
+function renderLan() {
+  const info = app.lan;
+  if (!info) return;
+  if (refs.lanToggle) refs.lanToggle.checked = Boolean(info.enabled);
+  if (refs.lanStatus) {
+    refs.lanStatus.textContent = info.enabled
+      ? info.lan_ip
+        ? `On air at ${info.lan_ip}:${info.port}`
+        : "On air, but no Wi-Fi address was found."
+      : "Sharing is off. The table stays on this computer.";
+  }
+  if (refs.lanUrl) {
+    refs.lanUrl.textContent = info.enabled
+      ? info.lan_url || "No network address available."
+      : "Turn on LAN access first.";
+  }
+  for (const [seat, element] of Object.entries(refs.lanLinks || {})) {
+    const url = info.enabled && info.seat_urls ? info.seat_urls[seat] : null;
+    element.textContent = url || "—";
+    const copy = element.parentElement?.querySelector("[data-copy-seat]");
+    if (copy) copy.disabled = !url;
+  }
+}
+
+async function refreshLan() {
+  try {
+    app.lan = await call("get_lan_info");
+    renderLan();
+  } catch (error) {
+    console.warn("Could not read LAN info", error);
+  }
+}
+
+async function openLanDialog() {
+  if (!refs.lanDialog) return;
+  openDialog(refs.lanDialog);
+  await refreshLan();
+}
+
+async function setLanEnabled(enabled) {
+  if (refs.lanToggle) refs.lanToggle.disabled = true;
+  try {
+    app.lan = await call("set_lan_mode", Boolean(enabled));
+    renderLan();
+    toast({
+      title: app.lan.enabled ? "LAN play is on" : "LAN play is off",
+      description: app.lan.enabled
+        ? app.lan.lan_url
+          ? `Open ${app.lan.lan_url} on a phone.`
+          : "Connect this computer to Wi-Fi to get a link."
+        : "Phones can no longer reach this table.",
+      kind: app.lan.enabled ? "success" : "info",
+      duration: 5200,
+    });
+  } catch (error) {
+    if (refs.lanToggle) refs.lanToggle.checked = !enabled;
+    toast({ title: "LAN mode did not change", description: composeError(error), kind: "error" });
+  } finally {
+    if (refs.lanToggle) refs.lanToggle.disabled = false;
+  }
+}
+
+async function copySeatLink(seat) {
+  const url = app.lan && app.lan.seat_urls ? app.lan.seat_urls[seat] : null;
+  if (!url) return;
+  const copied = await copyText(url);
+  toast({
+    title: copied ? "Link copied" : "Copy this link",
+    description: copied ? url : `Select and copy: ${url}`,
+    kind: copied ? "success" : "info",
+  });
+}
+
+/* --------------------------------------------------------------------------
    Wiring
    -------------------------------------------------------------------------- */
 
@@ -973,6 +1080,13 @@ function wireShell() {
 
   refs.newGameButton?.addEventListener("click", () => openNewGame());
   refs.stageImport?.addEventListener("click", openImport);
+  $("btn-lan")?.addEventListener("click", openLanDialog);
+  $("btn-lan-mobile")?.addEventListener("click", openLanDialog);
+  refs.lanToggle?.addEventListener("change", (event) => setLanEnabled(event.target.checked));
+  for (const button of document.querySelectorAll("[data-copy-seat]")) {
+    button.addEventListener("click", () => copySeatLink(button.dataset.copySeat));
+  }
+  refs.seatSelect?.addEventListener("change", (event) => setSeat(event.target.value));
   refs.reviewCtaButton?.addEventListener("click", () => {
     tabs.setActive("review");
     reviewPanel?.focusOrStart();
@@ -986,7 +1100,7 @@ function wireShell() {
   for (const closer of document.querySelectorAll("[data-close-dialog]")) {
     closer.addEventListener("click", () => closeDialog(closer.closest("dialog")));
   }
-  for (const dialog of [refs.newGameDialog, refs.engineDialog]) {
+  for (const dialog of [refs.newGameDialog, refs.engineDialog, refs.lanDialog]) {
     dialog?.addEventListener("click", (event) => {
       if (event.target === dialog) closeDialog(dialog);
     });
@@ -1094,6 +1208,10 @@ function wireShell() {
     },
     playMove,
     flip: flipBoard,
+    setSeat,
+    getSeat: () => app.seat,
+    getLanInfo: () => call("get_lan_info"),
+    setLanMode: (enabled) => call("set_lan_mode", enabled),
     bridge: () => ({ mode: app.bridgeMode, info: app.apiInfo }),
   };
 }
@@ -1176,6 +1294,8 @@ async function bootstrap() {
   if (booting) return;
   booting = true;
   bridgeStatus("pending");
+  if (refs.seatSelect) refs.seatSelect.value = app.seat;
+  if (app.seat === "white" || app.seat === "black") app.orientation = app.seat;
   try {
     app.bridgeMode = await connect();
     const [info, state, samples] = await Promise.all([
