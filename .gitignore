@@ -18,3 +18,5 @@ bin/
 .DS_Store
 Thumbs.db
 chess_master_source_bundle.txt
+all_files.txt
+update_all_files.py
