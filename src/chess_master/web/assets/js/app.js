@@ -2,10 +2,12 @@
 
 import { call, connect, detailLines, errorMessage } from "./api.js";
 import { BoardController } from "./board.js";
+import { HistoryPanel } from "./historyPanel.js";
 import { ImportPanel } from "./importPanel.js";
 import { renderMoves } from "./moves.js";
-import { renderPlayers } from "./players.js";
+import { anchorClock, remainingClock, renderClocks, renderPlayers } from "./players.js";
 import { ReviewPanel } from "./reviewPanel.js";
+import { sound } from "./sound.js";
 import {
   app,
   canHumanMove,
@@ -96,8 +98,10 @@ refs.moves = {
 let board = null;
 let panel = null;
 let reviewPanel = null;
+let historyPanel = null;
 let tabs = null;
 let booting = false;
+let lastReviewSignature = "";
 
 /* --------------------------------------------------------------------------
    State rendering
@@ -109,8 +113,13 @@ function renderAll() {
 
   const preview = reviewPanel?.previewState() || null;
   app.preview = preview;
-  const interactive = !app.busy && !app.navigating && !preview && canHumanMove(game);
-  board.render(game, { orientation: app.orientation, canPlay: interactive, preview });
+  const sandbox = reviewPanel?.boardState?.() || null;
+  const interactive =
+    !app.busy &&
+    !app.navigating &&
+    !preview &&
+    (sandbox ? Boolean(sandbox.playable) : canHumanMove(game));
+  board.render(game, { orientation: app.orientation, canPlay: interactive, preview, sandbox });
   renderPlayers(game, app.orientation, refs.players);
   renderMoves(game, refs.moves);
   renderHeader(game);
@@ -123,6 +132,11 @@ function renderAll() {
   if (app.activeTab === "import") panel.refreshExport();
   reviewPanel?.setGame(game);
   reviewPanel?.update(game.review);
+  const reviewSignature = game.review?.status === "complete" ? game.review.signature : "";
+  if (reviewSignature && reviewSignature !== lastReviewSignature) {
+    lastReviewSignature = reviewSignature;
+    historyPanel?.refreshCount();
+  }
   syncArrows();
   renderReviewCta(game);
 
@@ -338,6 +352,7 @@ function renderEngineStrip() {
 
 function applyState(state, { autoOrient = false } = {}) {
   if (!state) return;
+  const gameChanged = app.game?.game_id !== state.game_id;
   app.game = state;
   app.evaluation = state.evaluation || null;
   app.engine = state.engine || null;
@@ -345,7 +360,11 @@ function applyState(state, { autoOrient = false } = {}) {
   app.pendingPromotion = null;
   board.clearPromotion();
   hidePromotion();
+  anchorClock(state);
   renderAll();
+  if (gameChanged && (state.source === "pgn" || state.status?.state !== "in_progress")) {
+    historyPanel?.refreshCount();
+  }
   app.stateFingerprint = stateFingerprint(state);
 }
 
@@ -439,6 +458,7 @@ async function playMove(uci) {
     const state = await call("make_move", uci);
     app.busy = false;
     applyState(state);
+    sound.move(state.last_move, state.status);
     if (branching) {
       toast({
         title: "New branch started",
@@ -461,7 +481,19 @@ async function playMove(uci) {
 
 function announceOutcome(previous, next) {
   if (!previous || previous.status.state !== "in_progress" || next.status.state === "in_progress") return;
+  historyPanel?.refreshCount();
+  if (next.status.state === "timeout") {
+    sound.play("timeout");
+    toast({
+      title: "Time forfeit",
+      description: `${titleCase(next.status.winner)} wins on time.`,
+      kind: "warning",
+      duration: 6500,
+    });
+    return;
+  }
   if (next.status.state === "checkmate") {
+    sound.play("game_over");
     toast({
       title: "Checkmate",
       description: `${titleCase(next.status.winner)} wins the game.`,
@@ -469,6 +501,7 @@ function announceOutcome(previous, next) {
       duration: 6500,
     });
   } else {
+    sound.play("game_over");
     const reason = (next.status.reason || "draw").replace(/_/g, " ");
     toast({ title: "Draw", description: `The game ends: ${reason}.`, kind: "info", duration: 6000 });
   }
@@ -476,6 +509,8 @@ function announceOutcome(previous, next) {
 
 async function navigateTo(index) {
   if (!app.game || app.busy || app.navigating || app.pendingPromotion) return;
+  // The retry sandbox owns the board until it is continued or cancelled.
+  if (reviewPanel?.isRetrying()) return;
   const total = app.game.total_plies;
   const target = Math.max(0, Math.min(total, Number(index)));
   if (!Number.isFinite(target) || target === app.game.ply) return;
@@ -486,6 +521,7 @@ async function navigateTo(index) {
   try {
     const state = await call("navigate_ply", target);
     applyState(state);
+    if (state.last_move) sound.move(state.last_move);
     pollSoon(60);
   } catch (error) {
     toast({ title: "Could not navigate", description: composeError(error), kind: "error" });
@@ -543,7 +579,12 @@ function choosePromotion(piece) {
   app.pendingPromotion = null;
   hidePromotion();
   board.clearPromotion();
-  playMove(`${pending.from}${pending.to}${piece}`);
+  const uci = `${pending.from}${pending.to}${piece}`;
+  if (reviewPanel?.isRetrying()) {
+    reviewPanel.handleRetryMove(uci, piece);
+    return;
+  }
+  playMove(uci);
 }
 
 function cancelPromotion() {
@@ -615,6 +656,8 @@ function openNewGame(mode = null) {
   }
   app.newColor = game && game.mode === "stockfish" ? game.engine?.player_color || "white" : "white";
   app.newElo = game && game.mode === "stockfish" ? game.engine?.bot_elo || 1400 : 1400;
+  const clocks = game && game.clocks;
+  if (clocks && clocks.enabled && clocks.label) app.newTimeControl = clocks.label;
 
   syncNewGameForm();
   openDialog(refs.newGameDialog);
@@ -636,6 +679,16 @@ function syncNewGameForm() {
   const engineFields = $("new-stockfish-fields");
   if (passFields) passFields.hidden = stockfish;
   if (engineFields) engineFields.hidden = !stockfish;
+
+  for (const button of document.querySelectorAll("#new-time-control [data-time-control]")) {
+    const selected = button.dataset.timeControl === app.newTimeControl;
+    button.classList.toggle("is-active", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  }
+  const timeReadout = $("new-time-control-label");
+  if (timeReadout) {
+    timeReadout.textContent = app.newTimeControl === "unlimited" ? "Unlimited" : app.newTimeControl;
+  }
 
   for (const button of document.querySelectorAll("#new-color [data-color]")) {
     const selected = button.dataset.color === app.newColor;
@@ -688,6 +741,7 @@ async function startNewGame(event) {
     const black = ($("new-black-name")?.value || "").trim() || "Black";
     options = { white_name: white, black_name: black };
   }
+  options.time_control = app.newTimeControl === "unlimited" ? null : app.newTimeControl;
 
   const state = await withBusy(() => call("new_game", mode, options), {
     closeDialogAfter: refs.newGameDialog,
@@ -758,6 +812,22 @@ async function toggleEval() {
   pollSoon(60);
 }
 
+function syncSoundButton() {
+  const button = document.querySelector('[data-action="sound"]');
+  if (!button) return;
+  button.setAttribute("aria-pressed", String(!sound.muted));
+  const use = button.querySelector("use");
+  if (use) use.setAttribute("href", sound.muted ? "#i-volume-off" : "#i-volume");
+  const label = button.querySelector("span");
+  if (label) label.textContent = sound.muted ? "Muted" : "Sound";
+}
+
+function toggleSound() {
+  sound.toggle();
+  syncSoundButton();
+  if (!sound.muted) sound.play("move");
+}
+
 async function toggleArrows() {
   app.arrowsEnabled = !app.arrowsEnabled;
   const button = document.querySelector('[data-action="arrows"]');
@@ -810,9 +880,10 @@ async function pollEngine() {
       const previous = app.game;
       applyState(state);
       if (result.moved) {
-        announceOutcome(previous, state);
+        sound.move(state.last_move, state.status);
         window.dispatchEvent(new CustomEvent("chessmaster:enginemove", { detail: result.moved }));
       }
+      announceOutcome(previous, state);
       if (state.engine && state.engine.status === "error" && (!previous || !previous.engine || previous.engine.status !== "error")) {
         toast({
           title: "Stockfish stopped",
@@ -821,6 +892,11 @@ async function pollEngine() {
           duration: 7000,
         });
       }
+    } else if (app.game) {
+      // Same position, fresher clocks: re-anchor without a full re-render.
+      app.game.clocks = state.clocks || app.game.clocks;
+      anchorClock(app.game);
+      renderClocks(app.game, app.orientation, refs.players);
     }
   } catch (error) {
     console.warn("Engine poll failed", error);
@@ -833,6 +909,23 @@ function startEnginePolling() {
   if (app.pollTimer) return;
   app.pollTimer = window.setInterval(pollEngine, 240);
   pollEngine();
+}
+
+/** 100 ms local interpolation; when the active clock reaches zero, poll at once. */
+function startClockTicker() {
+  if (app.clockTimer) return;
+  app.clockTimer = window.setInterval(() => {
+    const game = app.game;
+    const clocks = game && game.clocks;
+    if (!clocks || !clocks.enabled) return;
+    renderClocks(game, app.orientation, refs.players);
+    if (!clocks.running || game.status.state !== "in_progress") return;
+    if (remainingClock(clocks.active_color) > 0) return;
+    const key = `${game.game_id}:${game.revision}:${game.ply}`;
+    if (app.clockZeroKey === key) return;
+    app.clockZeroKey = key;
+    pollEngine();
+  }, 100);
 }
 
 function openImport() {
@@ -943,13 +1036,18 @@ function wireShell() {
     ink: $("tab-ink"),
     onChange: (name) => {
       app.activeTab = name;
+      if (name !== "review") reviewPanel?.exitRetry();
       if (name === "import") panel?.refreshExport();
+      if (name === "history") historyPanel?.refresh();
       renderReviewCta(app.game);
     },
   });
 
   board = new BoardController(refs.board, {
-    onMove: (uci) => playMove(uci),
+    onMove: (uci) => {
+      if (reviewPanel?.isRetrying()) reviewPanel.handleRetryMove(uci);
+      else playMove(uci);
+    },
     onPromotion: (pending) => showPromotion(pending),
     loadingElement: refs.boardLoading,
   });
@@ -962,12 +1060,28 @@ function wireShell() {
   reviewPanel = new ReviewPanel({
     onNavigate: (ply) => navigateTo(ply),
     onPreview: (preview) => {
+      const previous = app.preview;
       app.preview = preview;
       renderAll();
+      if (preview && (!previous || previous.index !== preview.index)) sound.play("move");
     },
     onSceneChange: () => {
       applyReviewScene();
       renderReviewCta(app.game);
+    },
+    onRetryChange: () => renderAll(),
+  });
+
+  historyPanel = new HistoryPanel({
+    onOpen: (state, { review } = {}) => {
+      applyState(state, { autoOrient: true });
+      if (review) {
+        tabs.setActive("review");
+        if (!state.restored_review) reviewPanel?.focusOrStart();
+      } else {
+        tabs.setActive("moves");
+      }
+      historyPanel?.refreshCount();
     },
   });
 
@@ -995,6 +1109,12 @@ function wireShell() {
   for (const button of document.querySelectorAll("[data-new-mode]")) {
     button.addEventListener("click", () => {
       app.newMode = button.dataset.newMode;
+      syncNewGameForm();
+    });
+  }
+  for (const button of document.querySelectorAll("#new-time-control [data-time-control]")) {
+    button.addEventListener("click", () => {
+      app.newTimeControl = button.dataset.timeControl;
       syncNewGameForm();
     });
   }
@@ -1045,6 +1165,7 @@ function wireShell() {
       if (action === "reset") resetGame();
       if (action === "eval") toggleEval();
       if (action === "arrows") toggleArrows();
+      if (action === "sound") toggleSound();
     });
   });
 
@@ -1062,6 +1183,10 @@ function wireShell() {
   document.addEventListener("keydown", onKeyboard);
 
   document.body.classList.toggle("eval-hidden", !app.evalVisible);
+  syncSoundButton();
+  const unlockAudio = () => sound.unlock();
+  document.addEventListener("pointerdown", unlockAudio, { once: true });
+  document.addEventListener("keydown", unlockAudio, { once: true });
 
   window.chessMaster = {
     setArrows: (shapes) => board.setArrows(shapes),
@@ -1083,6 +1208,20 @@ function wireShell() {
     clearFollowUp: () => reviewPanel?.clearPreview(),
     getPreview: () => reviewPanel?.previewState() || null,
     getBoardScene: () => reviewPanel?.boardScene(app.game, app.orientation, app.preview) || null,
+    isRetrying: () => reviewPanel?.isRetrying() || false,
+    startRetry: () => reviewPanel?.startRetry(),
+    exitRetry: () => reviewPanel?.exitRetry(),
+    retryMove: (uci) => reviewPanel?.handleRetryMove(uci),
+    showRetryHint: () => reviewPanel?.hint(),
+    showRetrySolution: () => reviewPanel?.showSolution(),
+    getRetryState: () => reviewPanel?.retryState() || null,
+    getHistoryPanel: () => historyPanel,
+    getHistoryData: () => historyPanel?.data || null,
+    refreshHistory: () => historyPanel?.refresh({ silent: true }),
+    refreshHistoryCount: () => historyPanel?.refreshCount(),
+    listHistory: (limit, offset, mode, query) =>
+      call("list_archived_games", limit, offset, mode, query),
+    loadArchived: (gameId) => call("load_archived_game", gameId),
     toggleEval,
     toggleArrows,
     startGame: async (mode, options) => {
@@ -1118,11 +1257,30 @@ function onKeyboard(event) {
   if (target && target.closest && target.closest("input, textarea, select, [contenteditable='true']")) return;
   if (event.ctrlKey || event.metaKey || event.altKey) return;
 
+  if (event.key === "Escape" && reviewPanel?.isRetrying()) {
+    event.preventDefault();
+    reviewPanel.exitRetry();
+    return;
+  }
+
   const keyMoment = event.key === "k" || event.key === "K" || event.key === " ";
-  if (keyMoment && app.activeTab === "review" && reviewPanel?.report) {
+  if (keyMoment && !reviewPanel?.isRetrying() && app.activeTab === "review" && reviewPanel?.report) {
     if (event.key === " " && target?.closest?.("button, a, [role='button']")) return;
     event.preventDefault();
     reviewPanel.jumpKeyMoment(event.shiftKey ? -1 : 1);
+    return;
+  }
+
+  if ((event.key === "r" || event.key === "R") && app.activeTab === "review" && reviewPanel?.report) {
+    event.preventDefault();
+    if (reviewPanel.isRetrying()) reviewPanel.exitRetry();
+    else reviewPanel.startRetry();
+    return;
+  }
+
+  if (event.key === "h" || event.key === "H") {
+    event.preventDefault();
+    tabs.setActive("history");
     return;
   }
 
@@ -1163,6 +1321,11 @@ function onKeyboard(event) {
       event.preventDefault();
       toggleArrows();
       break;
+    case "m":
+    case "M":
+      event.preventDefault();
+      toggleSound();
+      break;
     default:
       break;
   }
@@ -1190,9 +1353,11 @@ async function bootstrap() {
 
     if (panel) panel.setSamples(app.samples);
     if (state) applyState(state);
+    historyPanel?.refreshCount();
     bridgeStatus("ready", info);
     await pushAnalysisOptions();
     startEnginePolling();
+    startClockTicker();
 
     if (refs.bootError) refs.bootError.hidden = true;
     document.body.classList.add("is-ready");

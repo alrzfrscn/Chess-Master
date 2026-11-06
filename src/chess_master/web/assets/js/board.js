@@ -15,6 +15,7 @@ export class BoardController {
     this.pendingPromotion = null;
     this.autoShapes = [];
     this.preview = null;
+    this.sandbox = null;
     this.reviewOverlay = null;
     this.arrowsFrame = null;
 
@@ -58,6 +59,7 @@ export class BoardController {
           blunder: { key: "l", color: "#ef4444", opacity: 0.96, lineWidth: 11 },
           alternative: { key: "a", color: "#34d399", opacity: 0.9, lineWidth: 8 },
           pv: { key: "p", color: "#5fd7a4", opacity: 0.92, lineWidth: 10 },
+          retry: { key: "t", color: "#f59e0b", opacity: 0.45, lineWidth: 6 },
         },
       },
     });
@@ -69,33 +71,39 @@ export class BoardController {
 
   }
 
-  render(game, { orientation = "white", canPlay = true, preview = null } = {}) {
+  render(game, { orientation = "white", canPlay = true, preview = null, sandbox = null } = {}) {
     this.game = game;
     this.orientation = orientation;
     this.canPlay = canPlay;
     this.preview = preview && preview.active ? preview : null;
+    this.sandbox = sandbox || null;
     const previewFen = this.preview?.fen || null;
-    const playable = Boolean(
-      game &&
-        !this.preview &&
-        game.status.state === "in_progress" &&
-        canPlay &&
-        !this.pendingPromotion,
-    );
-    const fen = previewFen || game.fen;
-    const turn = previewFen ? (fen.split(" ")[1] === "b" ? "black" : "white") : game.turn;
-    const dests = playable ? legalDests(game.fen) : new Map();
+    const sandboxFen = this.sandbox?.fen || null;
+    const playable = sandboxFen
+      ? Boolean(this.sandbox.playable)
+      : Boolean(
+          game &&
+            !this.preview &&
+            game.status.state === "in_progress" &&
+            canPlay &&
+            !this.pendingPromotion,
+        );
+    const fen = sandboxFen || previewFen || game.fen;
+    const turn = fen.split(" ")[1] === "b" ? "black" : "white";
+    const dests = playable ? legalDests(fen) : new Map();
     this.element.dataset.playable = String(playable);
     this.element.dataset.dests = String(dests.size);
     this.element.dataset.turn = turn;
     this.element.dataset.preview = String(Boolean(this.preview));
     this.element.classList.toggle("manipulable", playable);
-    const lastMove = this.preview?.lastMove
-      ? [this.preview.lastMove.from, this.preview.lastMove.to]
-      : game && game.last_move
-        ? [game.last_move.from, game.last_move.to]
-        : undefined;
-    const check = this.preview ? false : Boolean(game && game.status.check);
+    const lastMove = this.sandbox?.lastMove
+      ? [this.sandbox.lastMove.from, this.sandbox.lastMove.to]
+      : this.preview?.lastMove
+        ? [this.preview.lastMove.from, this.preview.lastMove.to]
+        : game && game.last_move
+          ? [game.last_move.from, game.last_move.to]
+          : undefined;
+    const check = this.sandbox ? false : this.preview ? false : Boolean(game && game.status.check);
 
     this.ground.set({
       fen,
@@ -107,7 +115,7 @@ export class BoardController {
       animation: { enabled: true, duration: 190 },
       movable: {
         free: false,
-        color: playable ? game.turn : undefined,
+        color: playable ? turn : undefined,
         showDests: true,
         dests,
       },
@@ -126,8 +134,9 @@ export class BoardController {
   handleDrop(from, to) {
     if (!this.game || this.pendingPromotion) return;
 
-    if (isPromotion(this.game.fen, from, to)) {
-      const color = this.game.turn;
+    const fen = this.sandbox?.fen || this.game.fen;
+    const color = this.sandbox?.color || this.game.turn;
+    if (isPromotion(fen, from, to)) {
       this.pendingPromotion = { from, to, color };
       this.lock();
       this.onPromotion({ from, to, color });
@@ -154,6 +163,7 @@ export class BoardController {
         orientation: this.orientation,
         canPlay: this.canPlay,
         preview: this.preview,
+        sandbox: this.sandbox,
       });
     }
   }
@@ -244,6 +254,20 @@ export class BoardController {
       }
     }
 
+    if (scene.ring) {
+      const box = this.squareBox(scene.ring.square);
+      if (box) {
+        const size = Math.max(20, box.size * 0.72);
+        const ring = document.createElement("span");
+        ring.className = "review-hint-ring";
+        ring.style.left = `${box.left + box.size / 2 - size / 2}px`;
+        ring.style.top = `${box.top + box.size / 2 - size / 2}px`;
+        ring.style.width = `${size}px`;
+        ring.style.height = `${size}px`;
+        this.overlay.append(ring);
+      }
+    }
+
     if (scene.badge) {
       const box = this.squareBox(scene.badge.square);
       if (box) {
@@ -276,6 +300,7 @@ export class BoardController {
         orientation: this.orientation,
         canPlay: this.canPlay,
         preview: this.preview,
+        sandbox: this.sandbox,
       });
     }
   }

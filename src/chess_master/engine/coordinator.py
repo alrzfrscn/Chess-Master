@@ -280,6 +280,14 @@ class EngineCoordinator:
                 return None
             return str(pending["uci"])
 
+    def clear_pending_bot(self) -> None:
+        """Drop a ready or queued bot move without touching the game line."""
+
+        with self._lock:
+            self._pending_bot = None
+            self._bot_scheduled = None
+            self._thinking = False
+
     # -- payloads --------------------------------------------------------
     def engine_payload(self, session: "GameSession") -> dict[str, Any]:
         status = self._worker.status_payload()
@@ -555,6 +563,52 @@ class EngineCoordinator:
     def game_review(self, *, full: bool = False) -> dict[str, Any]:
         return self.review_payload(full=full)
 
+    def restore_review(
+        self,
+        report: Mapping[str, Any],
+        *,
+        signature: str | None = None,
+        preset: str | None = None,
+    ) -> dict[str, Any]:
+        """Adopt a stored report so the dashboard opens without re-searching."""
+
+        stored = copy.deepcopy(dict(report))
+        summary = stored.get("summary") or {}
+        engine = stored.get("engine") or {}
+        timing = stored.get("timing") or {}
+        totals = stored.get("totals") or {}
+        with self._lock:
+            self._review_signature = signature or stored.get("signature")
+            self._review_report = stored
+            self._review_run_id = None
+            self._review = {
+                "available": True,
+                "status": "complete",
+                "signature": self._review_signature,
+                "game_id": stored.get("game_id"),
+                "preset": preset or stored.get("preset") or "standard",
+                "preset_label": stored.get("preset_label") or "",
+                "depth": engine.get("depth"),
+                "confirm_depth": engine.get("confirm_depth"),
+                "started_at": timing.get("started_at"),
+                "finished_at": timing.get("finished_at") or _utc_now(),
+                "progress": stored.get("progress")
+                or {"done": 0, "total": 0, "phase": "complete", "percent": 100.0},
+                "summary": {
+                    "accuracy": summary.get("accuracy"),
+                    "acpl": summary.get("acpl"),
+                    "acpl_trimmed": summary.get("acpl_trimmed"),
+                    "estimated_elo": summary.get("estimated_elo"),
+                    "counts": summary.get("counts"),
+                },
+                "opening": stored.get("opening"),
+                "engine": stored.get("engine"),
+                "timing": stored.get("timing"),
+                "error": None,
+                "move_count": int(totals.get("plies") or 0),
+            }
+        return self.review_payload(full=False)
+
     def _review_is_running(self) -> bool:
         with self._lock:
             return bool(
@@ -757,7 +811,7 @@ class EngineCoordinator:
         bot_color = session.engine_bot_color
         if not bot_color:
             return False
-        if position_status(session.board)["state"] != "in_progress":
+        if session.is_over:
             return False
         turn = "white" if session.board.turn == chess.WHITE else "black"
         return turn == bot_color

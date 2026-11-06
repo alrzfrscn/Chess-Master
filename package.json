@@ -15,5 +15,19 @@
     "chess.js": "1.4.0",
     "chessground": "9.2.1",
     "tailwindcss": "^4.1.0"
-  }
+  },
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alrzfrscn/Chess-Master.git"
+  },
+  "keywords": [],
+  "bugs": {
+    "url": "https://github.com/alrzfrscn/Chess-Master/issues"
+  },
+  "homepage": "https://github.com/alrzfrscn/Chess-Master#readme"
 }

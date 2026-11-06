@@ -24,6 +24,10 @@ export const app = {
   newMode: "pass_play",
   newColor: "white",
   newElo: 1400,
+  newTimeControl: "unlimited",
+  clockAnchor: null,
+  clockTimer: null,
+  clockZeroKey: "",
 };
 
 export function setGame(game) {
@@ -140,6 +144,9 @@ export function positionTitle(game) {
   if (status.state === "checkmate") {
     return `Checkmate — ${titleCase(status.winner)} wins`;
   }
+  if (status.state === "timeout") {
+    return `${titleCase(status.winner)} wins on time`;
+  }
   if (status.state === "draw") {
     const reasons = {
       stalemate: "Stalemate",
@@ -156,6 +163,7 @@ export function positionTitle(game) {
 export function turnDescription(game) {
   if (!game) return "White to move";
   if (game.status.state === "checkmate") return `${titleCase(game.status.winner)} wins by checkmate`;
+  if (game.status.state === "timeout") return `${titleCase(game.status.winner)} wins on time`;
   if (game.status.state === "draw") return "The game is drawn";
   if (game.engine && game.engine.thinking) return "Stockfish is thinking…";
   return `${titleCase(game.turn)} to move${game.status.check ? " · check" : ""}`;
@@ -179,6 +187,9 @@ export function sessionEvent(game) {
   }
   if (game.status.state === "checkmate") {
     return `${titleCase(game.status.winner)} delivered checkmate`;
+  }
+  if (game.status.state === "timeout") {
+    return `${titleCase(game.status.winner)} won on time`;
   }
   if (game.status.state === "draw") {
     return "The game ended in a draw";

@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-__all__ = ["BIN_ROOT", "PACKAGE_ROOT", "PROJECT_ROOT", "WEB_ROOT"]
+__all__ = [
+    "BIN_ROOT",
+    "DEFAULT_DB_PATH",
+    "PACKAGE_ROOT",
+    "PROJECT_ROOT",
+    "STATE_ROOT",
+    "WEB_ROOT",
+]
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 
@@ -18,3 +25,7 @@ if not (PROJECT_ROOT / "pyproject.toml").exists():
 
 BIN_ROOT = PROJECT_ROOT / "bin"
 WEB_ROOT = PACKAGE_ROOT / "web"
+
+STATE_ROOT = PROJECT_ROOT / "state"
+DEFAULT_DB_PATH = STATE_ROOT / "chess_master.db"
+STATE_ROOT.mkdir(parents=True, exist_ok=True)

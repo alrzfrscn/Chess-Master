@@ -16,3 +16,12 @@ def fixture_text(name: str) -> str:
 @pytest.fixture
 def read_fixture():
     return fixture_text
+
+
+@pytest.fixture(autouse=True)
+def isolated_default_archive(tmp_path, monkeypatch):
+    """Keep auto-saved test games out of the user's real state/ archive."""
+
+    from chess_master.storage import db as store_db
+
+    monkeypatch.setattr(store_db, "DEFAULT_DB_PATH", tmp_path / "chess_master.db")

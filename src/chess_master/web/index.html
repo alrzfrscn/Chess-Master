@@ -41,6 +41,15 @@
           <path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3Z" />
           <path d="M5 3v4M3 5h4M19 17v4M17 19h4" />
         </symbol>
+        <symbol id="i-volume" viewBox="0 0 24 24">
+          <path d="M11 5 6 9H3v6h3l5 4V5Z" />
+          <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+          <path d="M18.5 5.5a9 9 0 0 1 0 13" />
+        </symbol>
+        <symbol id="i-volume-off" viewBox="0 0 24 24">
+          <path d="M11 5 6 9H3v6h3l5 4V5Z" />
+          <path d="m16 9 5 6M21 9l-5 6" />
+        </symbol>
         <symbol id="i-flip" viewBox="0 0 24 24">
           <path d="M12 2v20" />
           <path d="M7 7 2 12l5 5V7Z" />
@@ -136,6 +145,14 @@
           <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5Z" />
           <path d="M4 5.5v15A2.5 2.5 0 0 0 6.5 23H20" />
         </symbol>
+        <symbol id="i-archive" viewBox="0 0 24 24">
+          <rect x="3" y="4" width="18" height="4" rx="1" />
+          <path d="M5 8v11a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8M10 12h4" />
+        </symbol>
+        <symbol id="i-search" viewBox="0 0 24 24">
+          <circle cx="11" cy="11" r="7" />
+          <path d="m20 20-3.5-3.5" />
+        </symbol>
         <symbol id="i-pause" viewBox="0 0 24 24">
           <path d="M10 5v14M14 5v14" />
         </symbol>
@@ -202,6 +219,17 @@
                 <span class="nav-sub">Accuracy &amp; turning points</span>
               </span>
               <span class="nav-tail"><span class="nav-badge">Phase 4</span></span>
+            </button>
+            <button type="button" class="nav-item" data-open-tab="history">
+              <span class="nav-icon"><svg class="icon"><use href="#i-archive" /></svg></span>
+              <span class="nav-copy">
+                <span class="nav-label">History / Archive</span>
+                <span class="nav-sub">Saved games &amp; progress</span>
+              </span>
+              <span class="nav-tail">
+                <span class="nav-badge nav-badge-count" id="history-nav-count">0</span>
+                <kbd class="kbd">H</kbd>
+              </span>
             </button>
           </section>
         </nav>
@@ -284,6 +312,10 @@
               <div class="captured-strip" data-captured aria-label="Captured pieces"></div>
               <span class="material-badge" data-material hidden></span>
             </div>
+            <div class="player-clock" data-clock hidden>
+              <span class="clock-time" data-clock-time>10:00</span>
+              <span class="clock-inc" data-clock-inc hidden></span>
+            </div>
           </div>
 
           <div class="board-area" id="board-area">
@@ -344,6 +376,10 @@
               <div class="captured-strip" data-captured aria-label="Captured pieces"></div>
               <span class="material-badge" data-material hidden></span>
             </div>
+            <div class="player-clock" data-clock hidden>
+              <span class="clock-time" data-clock-time>10:00</span>
+              <span class="clock-inc" data-clock-inc hidden></span>
+            </div>
           </div>
 
           <div class="board-toolbar" role="toolbar" aria-label="Board controls">
@@ -373,6 +409,12 @@
                 <svg class="icon"><use href="#i-arrow-up-right" /></svg>
                 <span>Best move</span>
                 <kbd class="kbd kbd-tiny">A</kbd>
+              </button>
+              <span class="tool-divider"></span>
+              <button type="button" class="tool-btn" data-action="sound" aria-pressed="true" title="Toggle sound (M)">
+                <svg class="icon"><use href="#i-volume" /></svg>
+                <span>Sound</span>
+                <kbd class="kbd kbd-tiny">M</kbd>
               </button>
             </div>
             <div class="turn-indicator" id="turn-indicator">
@@ -451,6 +493,19 @@
           >
             <span>Review</span>
             <span class="tab-count tab-count-warm">P4</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            class="inspector-tab"
+            id="tab-history"
+            data-tab="history"
+            aria-selected="false"
+            aria-controls="panel-history"
+            tabindex="-1"
+          >
+            <span>History</span>
+            <span class="tab-count" id="history-tab-count">0</span>
           </button>
           <span class="tab-ink" id="tab-ink" aria-hidden="true"></span>
         </div>
@@ -766,12 +821,28 @@
                     <svg class="icon"><use href="#i-chevron-right" /></svg>
                     <span>Show Follow-Up</span>
                   </button>
+                  <button type="button" class="btn btn-quiet btn-compact btn-retry" id="btn-retry-mistake" hidden>
+                    <svg class="icon"><use href="#i-reset" /></svg>
+                    <span>Retry</span>
+                    <kbd class="kbd kbd-tiny">R</kbd>
+                  </button>
                   <div class="pv-controls" id="pv-controls" hidden>
                     <button type="button" class="pv-btn" data-pv="prev" title="Previous continuation move">← Step</button>
                     <span class="pv-progress" id="pv-progress">0 of 0</span>
                     <button type="button" class="pv-btn" data-pv="next" title="Next continuation move">Step →</button>
                     <button type="button" class="pv-btn pv-btn-play" data-pv="play" id="pv-play">Play Line</button>
                     <button type="button" class="pv-btn pv-btn-exit" data-pv="exit" id="pv-exit">Back to Game</button>
+                  </div>
+                </div>
+                <div class="retry-panel" id="retry-panel" hidden aria-live="polite">
+                  <p class="retry-prompt" id="retry-prompt"></p>
+                  <p class="retry-feedback" id="retry-feedback" hidden></p>
+                  <div class="retry-actions">
+                    <button type="button" class="pv-btn" id="btn-retry-hint">Hint</button>
+                    <button type="button" class="pv-btn" id="btn-retry-solution">Show Solution</button>
+                    <button type="button" class="pv-btn" id="btn-retry-trybest" hidden>Try for #1 Move</button>
+                    <button type="button" class="pv-btn pv-btn-play" id="btn-retry-continue" hidden>Continue Review</button>
+                    <button type="button" class="pv-btn pv-btn-exit" id="btn-retry-cancel">Cancel · Esc</button>
                   </div>
                 </div>
                 <div class="pv-banner" id="pv-banner" hidden></div>
@@ -830,6 +901,122 @@
                 </p>
               </div>
             </div>
+          </section>
+
+          <section
+            class="tab-panel"
+            id="panel-history"
+            role="tabpanel"
+            aria-labelledby="tab-history"
+            tabindex="0"
+            hidden
+          >
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">Archive</p>
+                <h2>Game history</h2>
+              </div>
+              <span class="panel-chip panel-chip-warm" id="history-state-chip">Local</span>
+            </div>
+
+            <section class="history-kpis" id="history-kpis" aria-label="Archive summary">
+              <article class="history-kpi">
+                <span class="history-kpi-label">Total games</span>
+                <strong class="history-kpi-value" id="history-total">0</strong>
+                <small class="history-kpi-sub">Saved on this device</small>
+              </article>
+              <article class="history-kpi">
+                <span class="history-kpi-label">Win / Draw / Loss</span>
+                <strong class="history-kpi-value" id="history-wdl">0 / 0 / 0</strong>
+                <small class="history-kpi-sub">White / draw / Black</small>
+              </article>
+              <article class="history-kpi">
+                <span class="history-kpi-label">Avg accuracy</span>
+                <strong class="history-kpi-value" id="history-accuracy">—</strong>
+                <small class="history-kpi-sub">Reviewed games</small>
+              </article>
+              <article class="history-kpi">
+                <span class="history-kpi-label">Peak est. Elo</span>
+                <strong class="history-kpi-value" id="history-elo">—</strong>
+                <small class="history-kpi-sub">Best reviewed side</small>
+              </article>
+            </section>
+
+            <section class="review-card history-trend-card" aria-labelledby="history-trend-title">
+              <header class="review-card-head">
+                <div>
+                  <p class="eyebrow">Progress</p>
+                  <h3 id="history-trend-title">Accuracy &amp; estimated Elo</h3>
+                </div>
+                <div class="review-chart-legend" aria-hidden="true">
+                  <span><i class="legend-swatch history-swatch-accuracy"></i>Accuracy</span>
+                  <span><i class="legend-swatch history-swatch-elo"></i>Est. Elo</span>
+                </div>
+              </header>
+              <div class="history-trend-wrap">
+                <svg
+                  id="history-trend"
+                  class="history-trend"
+                  viewBox="0 0 320 96"
+                  preserveAspectRatio="none"
+                  role="img"
+                  aria-label="Accuracy and estimated Elo across recent reviewed games"
+                ></svg>
+              </div>
+              <p class="history-trend-empty" id="history-trend-empty" hidden>
+                Finish a Game Review to start the performance trend.
+              </p>
+            </section>
+
+            <div class="history-filters">
+              <label class="history-search">
+                <svg class="icon"><use href="#i-search" /></svg>
+                <input
+                  id="history-search"
+                  class="input"
+                  type="search"
+                  placeholder="Search players, opening or ECO"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </label>
+              <div class="segmented history-mode" id="history-mode" role="group" aria-label="Archive mode">
+                <button type="button" class="segmented-btn is-active" data-history-mode="" aria-pressed="true">All</button>
+                <button type="button" class="segmented-btn" data-history-mode="stockfish" aria-pressed="false">Stockfish</button>
+                <button type="button" class="segmented-btn" data-history-mode="pass_play" aria-pressed="false">Pass &amp; Play</button>
+                <button type="button" class="segmented-btn" data-history-mode="import" aria-pressed="false">Imported</button>
+              </div>
+            </div>
+
+            <div class="history-list" id="history-list" aria-live="polite"></div>
+            <div class="history-empty" id="history-empty" hidden>
+              <span class="move-empty-icon"><svg class="icon"><use href="#i-archive" /></svg></span>
+              <p class="move-empty-title">The archive is empty</p>
+              <p class="move-empty-copy">Finish a game, import a PGN, or save the current line to see it here.</p>
+            </div>
+
+            <section class="history-db" id="history-db" aria-label="Database storage">
+              <div class="history-db-head">
+                <span class="status-dot is-online"></span>
+                <strong>Local database</strong>
+                <span class="history-db-size" id="history-db-size">—</span>
+              </div>
+              <code class="history-db-path" id="history-db-path">state\chess_master.db</code>
+              <div class="history-db-actions">
+                <button type="button" class="btn btn-quiet btn-compact" id="btn-history-copy-path">
+                  <svg class="icon"><use href="#i-copy" /></svg>
+                  <span>Copy path</span>
+                </button>
+                <button type="button" class="btn btn-quiet btn-compact" id="btn-history-export">
+                  <svg class="icon"><use href="#i-download" /></svg>
+                  <span>Export all PGN</span>
+                </button>
+                <button type="button" class="btn btn-danger btn-compact" id="btn-history-reset">
+                  <svg class="icon"><use href="#i-alert" /></svg>
+                  <span>Reset archive</span>
+                </button>
+              </div>
+            </section>
           </section>
         </div>
       </aside>
@@ -930,6 +1117,43 @@
             <svg class="icon"><use href="#i-alert" /></svg>
             <span>Stockfish is not available yet. Start the table, then use Engine setup to point Chess Master at a binary.</span>
           </p>
+        </div>
+
+        <div class="time-control-block">
+          <div class="time-control-head">
+            <span class="field-label">Time control</span>
+            <span class="time-control-readout" id="new-time-control-label">Unlimited</span>
+          </div>
+          <div class="time-control-groups" id="new-time-control" role="group" aria-label="Time control">
+            <div class="time-control-group">
+              <span class="time-control-group-label">Unlimited</span>
+              <div class="time-control-pills">
+                <button type="button" class="time-pill is-active" data-time-control="unlimited" aria-pressed="true">No clock</button>
+              </div>
+            </div>
+            <div class="time-control-group">
+              <span class="time-control-group-label">Bullet</span>
+              <div class="time-control-pills">
+                <button type="button" class="time-pill" data-time-control="1+0" aria-pressed="false">1+0</button>
+                <button type="button" class="time-pill" data-time-control="2+1" aria-pressed="false">2+1</button>
+              </div>
+            </div>
+            <div class="time-control-group">
+              <span class="time-control-group-label">Blitz</span>
+              <div class="time-control-pills">
+                <button type="button" class="time-pill" data-time-control="3+0" aria-pressed="false">3+0</button>
+                <button type="button" class="time-pill" data-time-control="3+2" aria-pressed="false">3+2</button>
+                <button type="button" class="time-pill" data-time-control="5+0" aria-pressed="false">5+0</button>
+              </div>
+            </div>
+            <div class="time-control-group">
+              <span class="time-control-group-label">Rapid</span>
+              <div class="time-control-pills">
+                <button type="button" class="time-pill" data-time-control="10+0" aria-pressed="false">10+0</button>
+                <button type="button" class="time-pill" data-time-control="15+10" aria-pressed="false">15+10</button>
+              </div>
+            </div>
+          </div>
         </div>
 
         <p class="dialog-note">

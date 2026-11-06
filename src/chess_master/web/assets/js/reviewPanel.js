@@ -3,6 +3,8 @@
  * so this module never needs an engine call to step through a line. */
 
 import { call, errorMessage } from "./api.js";
+import { Chess } from "../vendor/chess.js/chess.js";
+import { sound } from "./sound.js";
 import { toast } from "./ui.js";
 
 const PRESET_DEPTH = { fast: 10, standard: 14, deep: 16 };
@@ -32,6 +34,8 @@ const KEY_MOMENT_CLASSES = new Set([
   "miss",
   "blunder",
 ]);
+
+const RETRY_CLASSES = new Set(["inaccuracy", "mistake", "miss", "blunder"]);
 
 const PHASE_LABEL = {
   queued: "Queued",
@@ -98,6 +102,41 @@ function moveLabel(move) {
   return `${move.move_number}${move.color === "white" ? "." : "…"} ${move.san || move.uci}`;
 }
 
+function sameUci(left, right) {
+  return String(left || "").toLowerCase() === String(right || "").toLowerCase();
+}
+
+/** Apply a UCI move to a FEN, returning the attempt descriptor or null. */
+function applyUci(fen, uci, promotion = null) {
+  const text = String(uci || "");
+  if (text.length < 4) return null;
+  try {
+    const chess = new Chess(fen);
+    const move = chess.move({
+      from: text.slice(0, 2),
+      to: text.slice(2, 4),
+      promotion: promotion || text.slice(4, 5) || undefined,
+    });
+    if (!move) return null;
+    return {
+      uci: `${move.from}${move.to}${move.promotion || ""}`,
+      san: move.san,
+      from: move.from,
+      to: move.to,
+      fen: chess.fen(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Win probability for the side that owns the move. */
+function moverWin(winWhite, color) {
+  const value = Number(winWhite);
+  if (!Number.isFinite(value)) return null;
+  return color === "black" ? 100 - value : value;
+}
+
 function element(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -123,10 +162,11 @@ function bookGlyph() {
 }
 
 export class ReviewPanel {
-  constructor({ onNavigate, onPreview, onSceneChange } = {}) {
+  constructor({ onNavigate, onPreview, onSceneChange, onRetryChange } = {}) {
     this.onNavigate = onNavigate || (() => {});
     this.onPreview = onPreview || (() => {});
     this.onSceneChange = onSceneChange || (() => {});
+    this.onRetryChange = onRetryChange || (() => {});
     this.game = null;
     this.gameId = null;
     this.preset = "standard";
@@ -140,6 +180,7 @@ export class ReviewPanel {
     this.filter = null;
     this.currentMove = null;
     this.preview = null;
+    this.retry = null;
     this.playTimer = null;
 
     this.refs = {
@@ -178,6 +219,15 @@ export class ReviewPanel {
       coachBody: document.getElementById("coach-body"),
       coachBest: document.getElementById("coach-best"),
       showFollowup: document.getElementById("btn-show-followup"),
+      retryButton: document.getElementById("btn-retry-mistake"),
+      retryPanel: document.getElementById("retry-panel"),
+      retryPrompt: document.getElementById("retry-prompt"),
+      retryFeedback: document.getElementById("retry-feedback"),
+      retryHint: document.getElementById("btn-retry-hint"),
+      retrySolution: document.getElementById("btn-retry-solution"),
+      retryTryBest: document.getElementById("btn-retry-trybest"),
+      retryContinue: document.getElementById("btn-retry-continue"),
+      retryCancel: document.getElementById("btn-retry-cancel"),
       pvControls: document.getElementById("pv-controls"),
       pvBanner: document.getElementById("pv-banner"),
       pvProgress: document.getElementById("pv-progress"),
@@ -222,6 +272,12 @@ export class ReviewPanel {
       this.onNavigate(Number(row.dataset.reviewPly));
     });
     this.refs.showFollowup?.addEventListener("click", () => this.startPreview());
+    this.refs.retryButton?.addEventListener("click", () => this.startRetry());
+    this.refs.retryHint?.addEventListener("click", () => this.hint());
+    this.refs.retrySolution?.addEventListener("click", () => this.showSolution());
+    this.refs.retryTryBest?.addEventListener("click", () => this.retryAgain());
+    this.refs.retryContinue?.addEventListener("click", () => this.continueReview());
+    this.refs.retryCancel?.addEventListener("click", () => this.exitRetry());
     this.refs.pvControls?.addEventListener("click", (event) => {
       const button = event.target.closest("[data-pv]");
       if (!button) return;
@@ -264,6 +320,7 @@ export class ReviewPanel {
       this.stopPlayback();
       this.preview = null;
     }
+    if (this.retry && (changed || plyChanged)) this.clearRetryLocal();
     if (this.refs.run) {
       this.refs.run.disabled = this.busy || this.isRunning() || !game || !game.total_plies;
     }
@@ -271,6 +328,7 @@ export class ReviewPanel {
 
   resetLocal() {
     this.stopPlayback();
+    this.clearRetryLocal();
     this.review = null;
     this.report = null;
     this.loadedSignature = null;
@@ -279,6 +337,11 @@ export class ReviewPanel {
     this.filter = null;
     this.currentMove = null;
     this.preview = null;
+  }
+
+  clearRetryLocal() {
+    if (this.retry?.timer) window.clearTimeout(this.retry.timer);
+    this.retry = null;
   }
 
   update(review) {
@@ -294,6 +357,8 @@ export class ReviewPanel {
       review?.progress?.done,
       review?.progress?.total,
       review?.progress?.phase,
+      this.retry?.phase,
+      this.retry?.hint,
       review?.summary ? JSON.stringify(review.summary) : "",
     ].join("|");
     if (key !== this.lastKey) {
@@ -652,6 +717,7 @@ export class ReviewPanel {
       }
       if (this.refs.coachBest) this.refs.coachBest.hidden = true;
       this.renderPreviewUI();
+      this.renderRetryUI();
       return;
     }
 
@@ -696,17 +762,22 @@ export class ReviewPanel {
       }
     }
     this.renderPreviewUI();
+    this.renderRetryUI();
   }
 
   renderPreviewUI() {
     const followup = this.currentMove?.pv_followup;
     const canFollow = Boolean(followup?.moves?.length);
     if (this.refs.showFollowup) {
-      this.refs.showFollowup.hidden = !canFollow || Boolean(this.preview);
+      this.refs.showFollowup.hidden = !canFollow || Boolean(this.preview) || Boolean(this.retry);
       this.refs.showFollowup.disabled = !canFollow;
     }
-    if (this.refs.pvControls) this.refs.pvControls.hidden = !this.preview;
+    if (this.refs.pvControls) this.refs.pvControls.hidden = !this.preview || Boolean(this.retry);
 
+    if (this.retry) {
+      if (this.refs.pvBanner) this.refs.pvBanner.hidden = true;
+      return;
+    }
     if (!this.preview) {
       if (this.refs.pvBanner) this.refs.pvBanner.hidden = true;
       this.refs.coach?.classList.remove("is-previewing");
@@ -824,6 +895,291 @@ export class ReviewPanel {
     this.preview = null;
     this.renderPreviewUI();
     this.onPreview(null);
+  }
+
+  /* --------------------------------------------------------------------
+     Retry mistake sandbox
+     -------------------------------------------------------------------- */
+
+  moveAtPly(ply) {
+    return this.report?.moves?.find((item) => item.ply === Number(ply)) || null;
+  }
+
+  canRetry(move) {
+    const best = move?.best_move;
+    return Boolean(
+      move &&
+        RETRY_CLASSES.has(move.classification) &&
+        best?.from &&
+        best?.to &&
+        best?.uci &&
+        !move.is_book &&
+        !sameUci(best.uci, move.uci),
+    );
+  }
+
+  isRetrying() {
+    return Boolean(this.retry);
+  }
+
+  retryState() {
+    if (!this.retry) return null;
+    const board = this.boardState();
+    return {
+      ply: this.retry.ply,
+      phase: this.retry.phase,
+      fen: board?.fen || null,
+      playable: Boolean(board?.playable),
+      hint: Boolean(this.retry.hint),
+      attempt: this.retry.attempt
+        ? { uci: this.retry.attempt.uci, san: this.retry.attempt.san }
+        : null,
+      best: this.retry.move?.best_move
+        ? {
+            uci: this.retry.move.best_move.uci,
+            san: this.retry.move.best_move.san,
+            from: this.retry.move.best_move.from,
+            to: this.retry.move.best_move.to,
+          }
+        : null,
+    };
+  }
+
+  /** Board override consumed by app.js and board.js while the sandbox is open. */
+  boardState() {
+    if (!this.retry) return null;
+    const retry = this.retry;
+    const move = retry.move;
+    let fen = move.fen_before;
+    let lastMove = null;
+    let playable = retry.phase === "awaiting";
+    if (["correct", "alternative", "wrong", "solution"].includes(retry.phase)) {
+      fen = retry.fen || move.fen_before;
+      lastMove = retry.attempt
+        ? { from: retry.attempt.from, to: retry.attempt.to }
+        : null;
+      playable = false;
+    }
+    return { fen, color: move.color, lastMove, playable };
+  }
+
+  startRetry() {
+    if (!this.report) return false;
+    const ply = Number(this.game?.ply) || 0;
+    const move = this.moveAtPly(ply);
+    if (!this.canRetry(move)) {
+      toast({
+        title: "No retry for this ply",
+        description: move?.is_book
+          ? "Book moves are not mistakes."
+          : move?.best_move?.is_played
+            ? "You already played the engine's best move."
+            : "This move has no stored alternative.",
+        kind: "info",
+        duration: 2800,
+      });
+      return false;
+    }
+    this.stopPlayback();
+    this.clearPreview();
+    this.clearRetryLocal();
+    this.retry = {
+      ply: move.ply,
+      move,
+      phase: "awaiting",
+      hint: false,
+      attempt: null,
+      fen: move.fen_before,
+      timer: null,
+    };
+    this.renderRetryUI();
+    this.renderPreviewUI();
+    this.onRetryChange();
+    this.revealCoach();
+    return true;
+  }
+
+  exitRetry() {
+    if (!this.retry) return false;
+    this.clearRetryLocal();
+    this.renderRetryUI();
+    this.renderPreviewUI();
+    this.onRetryChange();
+    return true;
+  }
+
+  continueReview() {
+    if (!this.retry) return false;
+    const ply = this.retry.ply;
+    this.exitRetry();
+    // Key-moment navigation wraps; after the final moment resume on the next ply instead.
+    const hasNextMoment = (this.report?.key_moments || []).some((moment) => moment.ply > ply);
+    if (hasNextMoment && this.jumpKeyMoment(1)) return true;
+    this.onNavigate(Math.min((Number(this.game?.total_plies) || 0), ply + 1));
+    return true;
+  }
+
+  retryAgain() {
+    if (!this.retry) return false;
+    const move = this.retry.move;
+    if (this.retry.timer) window.clearTimeout(this.retry.timer);
+    this.retry = {
+      ply: move.ply,
+      move,
+      phase: "awaiting",
+      hint: false,
+      attempt: null,
+      fen: move.fen_before,
+      timer: null,
+    };
+    this.renderRetryUI();
+    this.onRetryChange();
+    return true;
+  }
+
+  hint() {
+    if (!this.retry || !["awaiting", "wrong"].includes(this.retry.phase)) return;
+    this.retry.hint = true;
+    this.renderRetryUI();
+    this.onRetryChange();
+  }
+
+  showSolution() {
+    if (!this.retry) return;
+    const move = this.retry.move;
+    const best = move.best_move;
+    if (!best?.uci) return;
+    const applied = applyUci(move.fen_before, best.uci);
+    if (!applied) return;
+    if (this.retry.timer) window.clearTimeout(this.retry.timer);
+    this.retry.phase = "solution";
+    this.retry.attempt = applied;
+    this.retry.fen = applied.fen;
+    this.retry.hint = true;
+    sound.play("move");
+    this.renderRetryUI();
+    this.onRetryChange();
+  }
+
+  handleRetryMove(uci, promotion = null) {
+    if (!this.retry || !["awaiting", "wrong"].includes(this.retry.phase)) return false;
+    const retry = this.retry;
+    const move = retry.move;
+    const applied = applyUci(move.fen_before, uci, promotion);
+    if (!applied) return false;
+    if (retry.timer) {
+      window.clearTimeout(retry.timer);
+      retry.timer = null;
+    }
+
+    const best = move.best_move;
+    if (best?.uci && sameUci(applied.uci, best.uci)) {
+      retry.phase = "correct";
+      retry.attempt = applied;
+      retry.fen = applied.fen;
+      sound.play("retry_correct");
+      this.renderRetryUI();
+      this.onRetryChange();
+      return true;
+    }
+
+    const bestWin = moverWin(best?.win_prob_white, move.color);
+    const alternative = (move.multi_pv || []).find(
+      (line) =>
+        Number(line.rank || 0) > 1 &&
+        sameUci(line.uci, applied.uci) &&
+        bestWin !== null &&
+        moverWin(line.win_prob_white, move.color) !== null &&
+        bestWin - moverWin(line.win_prob_white, move.color) < 2.0,
+    );
+    if (alternative) {
+      retry.phase = "alternative";
+      retry.attempt = applied;
+      retry.fen = applied.fen;
+      sound.play("retry_correct");
+      this.renderRetryUI();
+      this.onRetryChange();
+      return true;
+    }
+
+    retry.phase = "wrong";
+    retry.attempt = applied;
+    retry.fen = applied.fen;
+    sound.play("retry_wrong");
+    this.renderRetryUI();
+    this.onRetryChange();
+    retry.timer = window.setTimeout(() => {
+      if (!this.retry || this.retry !== retry || retry.phase !== "wrong") return;
+      retry.timer = null;
+      retry.phase = "awaiting";
+      retry.attempt = null;
+      retry.fen = move.fen_before;
+      this.renderRetryUI();
+      this.onRetryChange();
+    }, 450);
+    return true;
+  }
+
+  renderRetryUI() {
+    const refs = this.refs;
+    const retry = this.retry;
+    refs.coach?.classList.toggle("is-retrying", Boolean(retry));
+    if (refs.retryButton) {
+      refs.retryButton.hidden =
+        Boolean(retry) || Boolean(this.preview) || !this.canRetry(this.currentMove);
+    }
+    if (!refs.retryPanel) return;
+    refs.retryPanel.hidden = !retry;
+    if (!retry) {
+      refs.retryPanel.classList.remove("is-correct", "is-wrong");
+      return;
+    }
+
+    const move = retry.move;
+    const best = move.best_move;
+    const label = CLASS_META[move.classification]?.label || move.label || "Mistake";
+    const side = move.color === "black" ? "Black" : "White";
+    const attemptSan = retry.attempt?.san || "That move";
+    let prompt = "";
+    let feedback = "";
+
+    if (retry.phase === "correct") {
+      prompt = `Brilliant find! ${best?.san || "The engine move"} was the engine's best move.`;
+      feedback = "Correct! Continue the review to keep the story moving.";
+    } else if (retry.phase === "alternative") {
+      prompt = `Good move! ${attemptSan} also keeps the advantage. The engine's top choice was ${best?.san}.`;
+      feedback = "This line is nearly as strong as the engine's first choice.";
+    } else if (retry.phase === "wrong") {
+      prompt = `Not quite — ${attemptSan} doesn't solve the position. Try another move or click 'Hint'!`;
+    } else if (retry.phase === "solution") {
+      prompt = `Solution: ${best?.san}. Continue review when you're ready.`;
+      feedback = "The engine's best move has been played on the board.";
+    } else {
+      prompt = `You played ${move.san} (${label}) — Find a better move for ${side}!`;
+      feedback = retry.hint
+        ? `Hint: the piece on ${best?.from} is the one to move.`
+        : "";
+    }
+
+    refs.retryPanel.classList.toggle(
+      "is-correct",
+      ["correct", "alternative", "solution"].includes(retry.phase),
+    );
+    refs.retryPanel.classList.toggle("is-wrong", retry.phase === "wrong");
+    if (refs.retryPrompt) refs.retryPrompt.textContent = prompt;
+    if (refs.retryFeedback) {
+      refs.retryFeedback.hidden = !feedback;
+      refs.retryFeedback.textContent = feedback;
+    }
+
+    const canTry = ["awaiting", "wrong"].includes(retry.phase);
+    if (refs.retryHint) refs.retryHint.hidden = !canTry;
+    if (refs.retrySolution) refs.retrySolution.hidden = !canTry;
+    if (refs.retryTryBest) refs.retryTryBest.hidden = retry.phase !== "alternative";
+    if (refs.retryContinue) {
+      refs.retryContinue.hidden = !["correct", "alternative", "solution"].includes(retry.phase);
+    }
+    if (refs.retryCancel) refs.retryCancel.hidden = false;
   }
 
   revealCoach() {
@@ -1183,7 +1539,70 @@ export class ReviewPanel {
      Board scene
      -------------------------------------------------------------------- */
 
+  retryScene(orientation) {
+    const retry = this.retry;
+    if (!retry) return null;
+    const move = retry.move;
+    const best = move.best_move;
+    if (retry.phase === "awaiting") {
+      return {
+        arrows:
+          move.from && move.to
+            ? [{ orig: move.from, dest: move.to, brush: "retry" }]
+            : [],
+        overlay: {
+          tint: { square: move.to, classification: move.classification || "mistake" },
+          ring: retry.hint && best?.from ? { square: best.from } : null,
+          banner: null,
+          orientation,
+        },
+      };
+    }
+    if (retry.phase === "correct" || retry.phase === "solution") {
+      const meta = CLASS_META.best;
+      return {
+        arrows: best?.from && best?.to ? [{ orig: best.from, dest: best.to, brush: "best" }] : [],
+        overlay: {
+          badge: best?.to
+            ? {
+                square: best.to,
+                classification: "best",
+                symbol: meta.symbol,
+                label: meta.label,
+                san: best.san,
+              }
+            : null,
+          tint: best?.to ? { square: best.to, classification: "best" } : null,
+          banner: null,
+          orientation,
+        },
+      };
+    }
+    if (retry.phase === "wrong" && retry.attempt) {
+      return {
+        arrows: [{ orig: retry.attempt.from, dest: retry.attempt.to, brush: "miss" }],
+        overlay: {
+          tint: { square: retry.attempt.to, classification: "miss" },
+          banner: null,
+          orientation,
+        },
+      };
+    }
+    if (retry.phase === "alternative" && retry.attempt) {
+      return {
+        arrows: [{ orig: retry.attempt.from, dest: retry.attempt.to, brush: "good" }],
+        overlay: {
+          tint: { square: retry.attempt.to, classification: "good" },
+          banner: null,
+          orientation,
+        },
+      };
+    }
+    return null;
+  }
+
   boardScene(game, orientation, preview) {
+    if (this.retry) return this.retryScene(orientation);
     if (!this.report || !game) return null;
     if (preview?.active) {
       return {

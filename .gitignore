@@ -13,6 +13,8 @@ node_modules/
 # Local tooling and captures
 .openchamber/
 bin/
+state/*.db*
+state/*.db-*
 
 # OS noise
 .DS_Store

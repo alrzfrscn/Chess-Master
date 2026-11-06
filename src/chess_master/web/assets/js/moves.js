@@ -127,6 +127,9 @@ function statusLine(game) {
   if (game.status.state === "draw") {
     return "Draw";
   }
+  if (game.status.state === "timeout") {
+    return `${titleCase(game.status.winner)} wins on time`;
+  }
   if (game.engine && game.engine.thinking) {
     return "Stockfish is thinking…";
   }

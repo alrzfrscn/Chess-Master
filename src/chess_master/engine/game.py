@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import random
 import re
+import time
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -12,6 +14,7 @@ from typing import Any
 import chess
 
 from chess_master import __version__
+from chess_master.engine.clock import TIME_CONTROL_PRESETS, GameClock, resolve_time_control
 from chess_master.engine.errors import (
     GameOverError,
     IllegalMoveError,
@@ -57,6 +60,43 @@ def _player(color: str, name: str, **kwargs: Any) -> PlayerInfo:
 
 def _opposite(color: str) -> str:
     return "black" if color == "white" else "white"
+
+
+def _json_list(value: Any) -> list[Any]:
+    if not isinstance(value, str) or not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    if not isinstance(value, str) or not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _timeout_from_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    if record.get("termination_state") != "timeout":
+        return None
+    winner = record.get("winner")
+    if winner not in ("white", "black"):
+        return None
+    return {
+        "state": "timeout",
+        "reason": "time_forfeit",
+        "winner": winner,
+        "result": "1-0" if winner == "white" else "0-1",
+        "check": False,
+        "check_square": None,
+        "claimable_draw": None,
+    }
 
 
 def _coerce_player_color(value: Any) -> str:
@@ -124,6 +164,9 @@ class GameSession:
         start_comment: str = "",
         game_id: str | None = None,
         created_at: str | None = None,
+        time_control: Any = None,
+        clock: GameClock | None = None,
+        timeout: Mapping[str, Any] | None = None,
     ) -> None:
         if mode not in VALID_MODES and mode != "import":
             raise InvalidModeError(
@@ -146,6 +189,14 @@ class GameSession:
         self._start_comment = start_comment
         self._game_id = game_id or uuid.uuid4().hex[:12]
         self._created_at = created_at or _utc_now()
+        control = resolve_time_control(time_control)
+        if clock is None and control is not None:
+            clock = GameClock(
+                control,
+                active_color="white" if root.turn == chess.WHITE else "black",
+            )
+        self._clock = clock
+        self._timeout: dict[str, Any] | None = dict(timeout) if timeout else None
         self._engine_player_color: str | None = None
         self._engine_bot_color: str | None = None
         self._engine_bot_elo: int | None = None
@@ -224,6 +275,7 @@ class GameSession:
             headers=headers,
             players={"white": white, "black": black},
             source="new",
+            time_control=options.get("time_control"),
         )
         session._engine_player_color = player_color if mode == "stockfish" else None
         session._engine_bot_color = bot_color
@@ -294,6 +346,108 @@ class GameSession:
             source=source,
         )
 
+    @classmethod
+    def from_archive(
+        cls, record: Mapping[str, Any], review: Mapping[str, Any] | None = None
+    ) -> GameSession:
+        """Rebuild a session from a row written by :meth:`to_archive`."""
+
+        start_fen = str(record.get("start_fen") or chess.STARTING_FEN)
+        mode = str(record.get("mode") or "import")
+        if mode not in VALID_MODES and mode != "import":
+            mode = "import"
+        headers = _json_object(record.get("headers_json"))
+        time_control: Any = record.get("time_control")
+        clock_spec = str(headers.get("X-ClockMs") or "")
+        label = str(time_control or "").strip()
+        if "+" in clock_spec and label.lower() not in TIME_CONTROL_PRESETS:
+            initial, increment = clock_spec.split("+", 1)
+            if initial.isdigit() and increment.isdigit():
+                time_control = {
+                    "initial_ms": int(initial),
+                    "increment_ms": int(increment),
+                    "label": label or None,
+                }
+        board = chess.Board(start_fen)
+        moves: list[MoveRecord] = []
+        for item in _json_list(record.get("moves_json")):
+            try:
+                move = chess.Move.from_uci(str(item.get("uci") or ""))
+            except ValueError:
+                break
+            if move not in board.legal_moves:
+                break
+            fen_before = board.fen()
+            move_number = board.fullmove_number
+            color = "white" if board.turn == chess.WHITE else "black"
+            san = str(item.get("san") or board.san(move))
+            captured = capture_on_move(board, move)
+            board.push(move)
+            moves.append(
+                MoveRecord(
+                    ply=len(moves) + 1,
+                    move_number=move_number,
+                    color=color,
+                    san=san,
+                    uci=move.uci(),
+                    fen_before=fen_before,
+                    fen_after=board.fen(),
+                    comment=str(item.get("comment") or ""),
+                    captured=item.get("captured") or captured,
+                )
+            )
+
+        white_name = str(record.get("white_name") or headers.get("White") or "White")
+        black_name = str(record.get("black_name") or headers.get("Black") or "Black")
+        player_color = record.get("player_color")
+        bot_color = (
+            _opposite(player_color)
+            if mode == "stockfish" and player_color in _PLAYER_COLORS
+            else None
+        )
+        bot_elo = record.get("bot_elo") if mode == "stockfish" else None
+        players = {
+            color: _player(
+                color,
+                white_name if color == "white" else black_name,
+                rating=bot_elo if bot_color == color else None,
+                is_engine=bot_color == color,
+                extras=(
+                    {"engine_elo": bot_elo, "engine_label": _engine_label(int(bot_elo))}
+                    if bot_color == color and bot_elo
+                    else {}
+                ),
+            )
+            for color in ("white", "black")
+        }
+        headers.setdefault("Result", str(record.get("result") or "*"))
+        session = cls(
+            mode=mode,
+            start_fen=start_fen,
+            moves=moves,
+            headers=headers,
+            players=players,
+            source=str(record.get("source") or "archive"),
+            game_id=str(record.get("game_id") or "") or None,
+            created_at=str(record.get("created_at") or "") or None,
+            time_control=time_control,
+            timeout=_timeout_from_record(record),
+        )
+        if session._clock is not None:
+            # An archived table is finished or paused: never keep ticking it.
+            session._clock.running = False
+            session._clock.last_tick_monotonic = time.monotonic()
+            if session._timeout is not None:
+                loser = _opposite(str(session._timeout.get("winner")))
+                if loser == "white":
+                    session._clock.white_ms = 0
+                else:
+                    session._clock.black_ms = 0
+        session._engine_player_color = player_color if mode == "stockfish" else None
+        session._engine_bot_color = bot_color
+        session._engine_bot_elo = int(bot_elo) if bot_elo else None
+        return session
+
     # ------------------------------------------------------------------
     # Views and mutation
     # ------------------------------------------------------------------
@@ -333,6 +487,73 @@ class GameSession:
     def is_viewing_live(self) -> bool:
         return self._view_ply == len(self._moves)
 
+    @property
+    def clock(self) -> GameClock | None:
+        return self._clock
+
+    @property
+    def time_control(self) -> str:
+        return self._clock.control.label if self._clock is not None else "unlimited"
+
+    @property
+    def is_over(self) -> bool:
+        return self.status()["state"] != "in_progress"
+
+    def status(self) -> dict[str, Any]:
+        """Board status with a clock forfeit taking precedence while running."""
+
+        self._sync_clock()
+        if self._timeout is not None:
+            return dict(self._timeout)
+        return position_status(self._board)
+
+    def _sync_clock(self) -> None:
+        if self._clock is None or self._timeout is not None or not self._clock.running:
+            return
+        if position_status(self._board)["state"] != "in_progress":
+            self._clock.stop()
+            return
+        self._clock.tick()
+        self._check_timeout()
+
+    def _check_timeout(self) -> None:
+        if self._clock is None or self._timeout is not None:
+            return
+        loser = self._clock.flagged_color()
+        if loser is None:
+            return
+        winner = _opposite(loser)
+        base = position_status(self._board)
+        self._clock.stop()
+        self._timeout = {
+            "state": "timeout",
+            "reason": "time_forfeit",
+            "winner": winner,
+            "result": "1-0" if winner == "white" else "0-1",
+            "check": base["check"],
+            "check_square": base["check_square"],
+            "claimable_draw": None,
+        }
+        self._headers["Result"] = self._timeout["result"]
+        self.revision += 1
+
+    def _clock_payload(self) -> dict[str, Any]:
+        if self._clock is None:
+            return {
+                "enabled": False,
+                "control": None,
+                "label": "Unlimited",
+                "category": "unlimited",
+                "initial_ms": None,
+                "increment_ms": 0,
+                "white_ms": None,
+                "black_ms": None,
+                "active_color": None,
+                "running": False,
+                "flagged": False,
+            }
+        return self._clock.to_state()
+
     def move_ucis(self, up_to: int | None = None) -> list[str]:
         """The move stack replayed from the root, as UCI strings."""
 
@@ -350,7 +571,7 @@ class GameSession:
         if not isinstance(move_input, str) or not move_input.strip():
             raise InvalidInputError("Enter a move in UCI or SAN notation.")
 
-        status = position_status(self._board)
+        status = self.status()
         if status["state"] != "in_progress":
             raise GameOverError(
                 "The game is already over in this position.",
@@ -386,7 +607,11 @@ class GameSession:
         self._board = board
         self.revision += 1
 
-        status = position_status(board)
+        if self._clock is not None and self._clock.running:
+            self._clock.apply_move(color)
+        status = self.status()
+        if status["state"] != "in_progress" and self._clock is not None:
+            self._clock.stop()
         self._headers["Result"] = status["result"] if status["state"] != "in_progress" else "*"
         return self.to_state()
 
@@ -397,6 +622,12 @@ class GameSession:
         self._headers["Result"] = "*"
         self._import_meta = None
         self._start_comment = ""
+        if self._clock is not None:
+            self._clock = GameClock(
+                self._clock.control,
+                active_color="white" if self._root_board.turn == chess.WHITE else "black",
+            )
+        self._timeout = None
         self.revision += 1
         return self.to_state()
 
@@ -475,7 +706,7 @@ class GameSession:
     # Serialization
     # ------------------------------------------------------------------
     def to_state(self) -> dict[str, Any]:
-        status = position_status(self._board)
+        status = self.status()
         fallback_result = self._headers.get("Result", "*")
         result = result_from_status(status, fallback_result)
         status["result"] = result
@@ -522,6 +753,7 @@ class GameSession:
             "last_move": last_move,
             "moves": [record.to_dict() for record in self._moves],
             "status": status,
+            "clocks": self._clock_payload(),
             "material": material,
             "engine": self._engine_payload(),
             "evaluation": self._evaluation_placeholder(),
@@ -550,6 +782,43 @@ class GameSession:
             "headers": dict(self._headers),
             "ply": self._view_ply,
             "total_plies": len(self._moves),
+        }
+
+    def to_archive(self) -> dict[str, Any]:
+        """One flat row for the local SQLite archive."""
+
+        status = self.status()
+        headers = dict(self._headers)
+        if self._clock is not None:
+            # Keep the raw custom control so it can be rebuilt on load; ``time_control``
+            # alone is a human label and may not match a preset.
+            headers["X-ClockMs"] = (
+                f"{self._clock.control.initial_ms}+{self._clock.control.increment_ms}"
+            )
+        return {
+            "game_id": self._game_id,
+            "created_at": self._created_at,
+            "updated_at": _utc_now(),
+            "mode": self.mode,
+            "source": self.source,
+            "event": self._headers.get("Event") or self._mode_label(),
+            "white_name": self._players["white"].name,
+            "black_name": self._players["black"].name,
+            "bot_elo": self._engine_bot_elo,
+            "player_color": self._engine_player_color,
+            "time_control": self.time_control,
+            "result": result_from_status(status, self._headers.get("Result", "*")),
+            "termination_state": status["state"],
+            "termination_reason": status["reason"],
+            "winner": status["winner"],
+            "total_plies": len(self._moves),
+            "start_fen": self._start_fen,
+            "final_fen": self._board.fen(),
+            "pgn": self.export_pgn()["pgn"],
+            "moves_json": json.dumps(
+                [record.to_dict() for record in self._moves], ensure_ascii=False
+            ),
+            "headers_json": json.dumps(headers, ensure_ascii=False),
         }
 
     def _mode_label(self) -> str:

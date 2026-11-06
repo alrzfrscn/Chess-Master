@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import mimetypes
+import sys
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +31,17 @@ mimetypes.add_type("text/css", ".css")
 mimetypes.add_type("image/svg+xml", ".svg")
 mimetypes.add_type("font/woff2", ".woff2")
 mimetypes.add_type("application/x-chess-pgn", ".pgn")
+
+
+class _ThreadingHTTPServer(ThreadingHTTPServer):
+    # Chromium opens a burst of parallel module requests; the stdlib backlog of 5 is too small.
+    request_queue_size = 128
+
+    def handle_error(self, request, client_address) -> None:
+        # A page reload or closed tab aborts in-flight responses; that is not an error.
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            return
+        super().handle_error(request, client_address)
 
 
 class WebAppServer:
@@ -60,7 +72,7 @@ class WebAppServer:
     def _bind(self) -> ThreadingHTTPServer:
         if self._httpd is None:
             handler = self._make_handler()
-            self._httpd = ThreadingHTTPServer((self.host, self._requested_port), handler)
+            self._httpd = _ThreadingHTTPServer((self.host, self._requested_port), handler)
             self._httpd.daemon_threads = True
             self._port = self._httpd.server_address[1]
             logger.info("Serving Chess Master UI at %s (HTTP API: %s)", self.url, self.expose_api)
