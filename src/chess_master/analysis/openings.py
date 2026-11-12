@@ -22,6 +22,8 @@ from typing import Any, Iterable, Sequence
 
 import chess
 
+from chess_master.paths import OPENINGS_DATA_PATH
+
 __all__ = [
     "DEFAULT_DATA_PATH",
     "OpeningBook",
@@ -32,7 +34,11 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DATA_PATH = Path(__file__).with_name("openings_data.tsv")
+DEFAULT_DATA_PATH = (
+    OPENINGS_DATA_PATH
+    if OPENINGS_DATA_PATH.is_file()
+    else Path(__file__).with_name("openings_data.tsv")
+)
 
 
 @dataclass(frozen=True, slots=True)
