@@ -106,6 +106,12 @@
         <symbol id="i-x" viewBox="0 0 24 24">
           <path d="M18 6 6 18M6 6l12 12" />
         </symbol>
+        <symbol id="i-trash" viewBox="0 0 24 24">
+          <path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13M10 11v5M14 11v5" />
+        </symbol>
+        <symbol id="i-pointer" viewBox="0 0 24 24">
+          <path d="m5 3 14 8-6 1.6L9.5 19 5 3Z" />
+        </symbol>
         <symbol id="i-play" viewBox="0 0 24 24">
           <path d="m8 5 11 7-11 7V5Z" />
         </symbol>
@@ -416,24 +422,18 @@
                 <span>Sound</span>
                 <kbd class="kbd kbd-tiny">M</kbd>
               </button>
+              <span class="tool-divider"></span>
+              <div class="board-theme-switch" role="group" aria-label="Board theme">
+                <button type="button" class="theme-swatch theme-jade" data-board-theme="jade" aria-pressed="true" title="Jade — studio default" aria-label="Jade board theme"></button>
+                <button type="button" class="theme-swatch theme-classic" data-board-theme="classic" aria-pressed="false" title="Classic — tournament green" aria-label="Classic board theme"></button>
+                <button type="button" class="theme-swatch theme-walnut" data-board-theme="walnut" aria-pressed="false" title="Walnut — warm wood" aria-label="Walnut board theme"></button>
+                <button type="button" class="theme-swatch theme-ice" data-board-theme="ice" aria-pressed="false" title="Ice — arctic blue" aria-label="Ice board theme"></button>
+              </div>
             </div>
             <div class="turn-indicator" id="turn-indicator">
               <span class="turn-dot" id="turn-dot"></span>
               <span id="turn-label">White to move</span>
             </div>
-          </div>
-
-          <div class="engine-strip" id="engine-strip" hidden>
-            <span class="engine-strip-state">
-              <span class="status-dot" id="engine-strip-dot"></span>
-              <span id="engine-strip-name">Stockfish</span>
-            </span>
-            <span class="engine-strip-eval" id="engine-strip-eval">—</span>
-            <span class="engine-strip-pv" id="engine-strip-pv">Waiting for analysis</span>
-            <span class="engine-strip-depth" id="engine-strip-depth">d16 · 3 lines</span>
-            <button type="button" class="engine-strip-config" id="btn-engine-strip-config" aria-label="Engine settings" title="Engine settings">
-              <svg class="icon"><use href="#i-cpu" /></svg>
-            </button>
           </div>
         </section>
 
@@ -578,6 +578,51 @@
               <svg class="icon"><use href="#i-info" /></svg>
               <p>You are reviewing an earlier ply. Playing a move here starts a new branch and replaces the moves after it.</p>
             </div>
+
+            <section class="opening-card" id="opening-card" aria-label="Opening explorer">
+              <button
+                type="button"
+                class="opening-toggle"
+                id="opening-toggle"
+                aria-expanded="true"
+                aria-controls="opening-body"
+              >
+                <span class="opening-toggle-icon"><svg class="icon"><use href="#i-book" /></svg></span>
+                <span class="opening-toggle-copy">
+                  <span class="opening-toggle-title">Opening Explorer</span>
+                  <span class="opening-toggle-sub" id="opening-toggle-sub">Starting position</span>
+                </span>
+                <svg class="icon opening-chevron"><use href="#i-chevron-right" /></svg>
+              </button>
+
+              <div class="opening-body" id="opening-body">
+                <div class="opening-current">
+                  <span class="opening-eco" id="opening-eco">—</span>
+                  <div class="opening-current-copy">
+                    <strong id="opening-name">Starting position</strong>
+                    <span id="opening-variation">Play a book move or browse the ECO dictionary.</span>
+                  </div>
+                </div>
+
+                <div class="opening-continuations" id="opening-continuations"></div>
+                <p class="opening-empty" id="opening-empty" hidden>No named continuation from this position.</p>
+
+                <form class="opening-search" id="opening-search-form">
+                  <label class="opening-search-field">
+                    <svg class="icon"><use href="#i-search" /></svg>
+                    <input
+                      type="search"
+                      id="opening-search-input"
+                      placeholder="Browse ECO book — Sicilian, Najdorf, B90"
+                      autocomplete="off"
+                      aria-label="Search openings"
+                    />
+                  </label>
+                  <button type="submit" class="btn btn-quiet btn-compact" id="btn-opening-search">Search</button>
+                </form>
+                <div class="opening-results" id="opening-results" hidden></div>
+              </div>
+            </section>
           </section>
 
           <section
@@ -663,6 +708,83 @@
                 Copy current FEN
               </button>
             </div>
+
+            <div class="section-rule"><span>Board editor</span></div>
+            <section class="editor-card" id="editor-card" aria-label="Board editor">
+              <p class="editor-lede">
+                Place pieces on the board, then play the position against Stockfish or a friend.
+              </p>
+              <button
+                type="button"
+                class="btn btn-quiet btn-compact editor-toggle"
+                id="btn-editor-toggle"
+                aria-pressed="false"
+                aria-controls="editor-body"
+              >
+                <svg class="icon"><use href="#i-scan" /></svg>
+                <span id="btn-editor-toggle-label">Open editor</span>
+              </button>
+
+              <div class="editor-body" id="editor-body" hidden>
+                <div class="editor-palette" id="editor-palette" role="group" aria-label="Piece palette"></div>
+                <div class="editor-tools" role="group" aria-label="Editor tools">
+                  <button type="button" class="editor-tool" data-tool="move" aria-pressed="true" title="Click a piece, then a square">
+                    <svg class="icon"><use href="#i-pointer" /></svg>
+                    <span>Move</span>
+                  </button>
+                  <button type="button" class="editor-tool" data-tool="erase" aria-pressed="false" title="Remove the piece on a square">
+                    <svg class="icon"><use href="#i-trash" /></svg>
+                    <span>Erase</span>
+                  </button>
+                </div>
+
+                <div class="editor-row">
+                  <button type="button" class="editor-chip" data-preset="start">Starting position</button>
+                  <button type="button" class="editor-chip" data-preset="kings">Kings only</button>
+                  <button type="button" class="editor-chip" data-preset="flip">Flip board</button>
+                </div>
+
+                <div class="editor-row editor-row-split">
+                  <span class="editor-label">Side to move</span>
+                  <div class="editor-sides" role="group" aria-label="Side to move">
+                    <button type="button" class="editor-chip" data-side="white" aria-pressed="true">White</button>
+                    <button type="button" class="editor-chip" data-side="black" aria-pressed="false">Black</button>
+                  </div>
+                </div>
+
+                <div class="editor-castling">
+                  <span class="editor-label">Castling</span>
+                  <label class="editor-check"><input type="checkbox" data-castle="K" checked /> White O-O</label>
+                  <label class="editor-check"><input type="checkbox" data-castle="Q" checked /> White O-O-O</label>
+                  <label class="editor-check"><input type="checkbox" data-castle="k" checked /> Black O-O</label>
+                  <label class="editor-check"><input type="checkbox" data-castle="q" checked /> Black O-O-O</label>
+                </div>
+
+                <label class="editor-fen-wrap" for="editor-fen">
+                  <span class="field-label">FEN</span>
+                  <input id="editor-fen" class="input editor-fen" readonly spellcheck="false" />
+                </label>
+
+                <p class="editor-status is-legal" id="editor-status">
+                  <svg class="icon" id="editor-status-icon"><use href="#i-check-circle" /></svg>
+                  <span id="editor-status-text">Legal position</span>
+                </p>
+
+                <div class="editor-actions">
+                  <button type="button" class="btn btn-primary btn-compact" id="btn-editor-stockfish">
+                    <svg class="icon"><use href="#i-cpu" /></svg>
+                    <span>Play vs Stockfish from here</span>
+                  </button>
+                  <button type="button" class="btn btn-quiet btn-compact" id="btn-editor-passplay">
+                    <svg class="icon"><use href="#i-users" /></svg>
+                    <span>Pass &amp; Play from here</span>
+                  </button>
+                </div>
+              </div>
+            </section>
+
+            <div class="section-rule"><span>Endgame drills</span></div>
+            <div class="drill-list" id="drill-list"></div>
           </section>
 
           <section
@@ -754,6 +876,10 @@
                       <strong>Deep</strong>
                     </button>
                   </div>
+                  <button type="button" class="btn btn-quiet btn-compact" id="btn-export-card">
+                    <svg class="icon"><use href="#i-download" /></svg>
+                    <span>Export Card</span>
+                  </button>
                   <button type="button" class="btn btn-quiet btn-compact" id="btn-review-again">
                     <svg class="icon"><use href="#i-reset" /></svg>
                     <span>Review again</span>
@@ -1111,6 +1237,15 @@
             <p class="elo-note" id="new-elo-note">
               Calibrated Stockfish strength. At 3000 the engine plays at full power.
             </p>
+          </div>
+
+          <div class="field">
+            <span class="field-label">Bot move speed</span>
+            <div class="segmented segmented-compact" id="new-pace" role="group" aria-label="Bot move speed">
+              <button type="button" class="segmented-btn" data-pace="bullet" aria-pressed="false">Bullet · Fast</button>
+              <button type="button" class="segmented-btn" data-pace="blitz" aria-pressed="false">Blitz · Normal</button>
+              <button type="button" class="segmented-btn" data-pace="rapid" aria-pressed="false">Rapid · Slow</button>
+            </div>
           </div>
 
           <p class="engine-dialog-warning" id="new-engine-warning" hidden>

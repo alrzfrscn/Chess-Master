@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import random
 import threading
 import time
 from datetime import datetime, timezone
@@ -40,9 +41,40 @@ from chess_master.engine.status import position_status
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from chess_master.engine.game import GameSession
 
-__all__ = ["EngineCoordinator"]
+__all__ = ["EngineCoordinator", "BOT_PACE_DELAYS", "bot_move_delay"]
 
 logger = logging.getLogger(__name__)
+
+# Total wall-clock seconds from scheduling a bot search to releasing its move.
+BOT_PACE_DELAYS: dict[str, tuple[float, float]] = {
+    "instant": (0.0, 0.0),
+    "bullet": (0.35, 0.65),
+    "blitz": (0.75, 1.35),
+    "rapid": (1.5, 2.5),
+}
+_TIME_TROUBLE_DELAY = (0.18, 0.26)
+_LOW_CLOCK_DELAY = (0.35, 0.55)
+
+
+def _bot_remaining_ms(session: "GameSession") -> int | None:
+    clock = session.clock
+    bot_color = session.engine_bot_color
+    if clock is None or bot_color is None:
+        return None
+    return clock.white_ms if bot_color == "white" else clock.black_ms
+
+
+def bot_move_delay(session: "GameSession") -> float:
+    """Randomized human-like delay, shortened when the bot's clock is low."""
+
+    low, high = BOT_PACE_DELAYS.get(session.bot_pace, BOT_PACE_DELAYS["instant"])
+    remaining = _bot_remaining_ms(session)
+    if remaining is not None and session.bot_pace != "instant":
+        if remaining < 10_000:
+            low, high = _TIME_TROUBLE_DELAY
+        elif remaining < 25_000:
+            low, high = _LOW_CLOCK_DELAY[0], min(high, _LOW_CLOCK_DELAY[1])
+    return random.uniform(low, high)
 
 
 def _utc_now() -> str:
@@ -72,6 +104,7 @@ class EngineCoordinator:
         self._analysis: dict[str, Any] | None = None
         self._pending_bot: dict[str, Any] | None = None
         self._bot_scheduled: EngineToken | None = None
+        self._bot_ready_at = 0.0
         self._analysis_scheduled: EngineToken | None = None
         self._thinking = False
         self._last_error: str | None = None
@@ -237,6 +270,8 @@ class EngineCoordinator:
                         if self._token == token:
                             self._bot_scheduled = token
                             self._thinking = True
+                            # The delay covers the whole turn: search time counts.
+                            self._bot_ready_at = time.monotonic() + bot_move_delay(session)
 
         if enabled:
             with self._lock:
@@ -271,9 +306,13 @@ class EngineCoordinator:
             if pending["token"] != token:
                 self._pending_bot = None
                 return None
+            if pending["uci"] != "0000" and time.monotonic() < self._bot_ready_at:
+                # Search finished early: keep "thinking" until the pace is met.
+                return None
             self._pending_bot = None
             self._thinking = False
             self._bot_scheduled = None
+            self._bot_ready_at = 0.0
             if pending["uci"] == "0000":
                 return None
             if not self._is_bot_turn(session):
@@ -286,6 +325,7 @@ class EngineCoordinator:
         with self._lock:
             self._pending_bot = None
             self._bot_scheduled = None
+            self._bot_ready_at = 0.0
             self._thinking = False
 
     # -- payloads --------------------------------------------------------
@@ -323,6 +363,7 @@ class EngineCoordinator:
             "player_color": session.engine_player_color,
             "bot_color": session.engine_bot_color,
             "bot_elo": bot_elo,
+            "bot_pace": session.bot_pace if enabled else None,
             "bot": bot_profile,
             "orientation": session.engine_player_color or "white",
             "configurable": True,
@@ -723,6 +764,7 @@ class EngineCoordinator:
             self._analysis = None
             self._pending_bot = None
             self._bot_scheduled = None
+            self._bot_ready_at = 0.0
             self._analysis_scheduled = None
             self._thinking = False
             self._last_error = None
@@ -758,7 +800,8 @@ class EngineCoordinator:
                     "uci": uci,
                     "analysis": copy.deepcopy(payload),
                 }
-                self._thinking = False
+                # The move is computed, but the pace gate may still hold it.
+                self._thinking = True
             else:
                 logger.debug("Discarded stale bot move for revision %s", token.revision)
 
@@ -797,6 +840,7 @@ class EngineCoordinator:
         self._analysis = None
         self._pending_bot = None
         self._bot_scheduled = None
+        self._bot_ready_at = 0.0
         self._analysis_scheduled = None
         self._thinking = False
 

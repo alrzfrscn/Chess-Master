@@ -2,6 +2,8 @@
 
 import { call, connect, detailLines, errorMessage } from "./api.js";
 import { BoardController } from "./board.js";
+import { EditorPanel } from "./editorPanel.js";
+import { OpeningExplorer } from "./explorer.js";
 import { HistoryPanel } from "./historyPanel.js";
 import { ImportPanel } from "./importPanel.js";
 import { renderMoves } from "./moves.js";
@@ -53,12 +55,6 @@ const refs = {
   evalFill: $("eval-fill"),
   evalValue: $("eval-value"),
   evalPhase: $("eval-phase"),
-  engineStrip: $("engine-strip"),
-  engineStripDot: $("engine-strip-dot"),
-  engineStripName: $("engine-strip-name"),
-  engineStripEval: $("engine-strip-eval"),
-  engineStripPv: $("engine-strip-pv"),
-  engineStripDepth: $("engine-strip-depth"),
   engineStatusCard: $("engine-status-card"),
   engineStatusDot: $("engine-status-dot"),
   engineStatusTitle: $("engine-status-title"),
@@ -99,9 +95,14 @@ let board = null;
 let panel = null;
 let reviewPanel = null;
 let historyPanel = null;
+let explorer = null;
+let editorPanel = null;
 let tabs = null;
 let booting = false;
 let lastReviewSignature = "";
+
+const THEME_KEY = "chessMaster.boardTheme";
+const THEMES = ["jade", "classic", "walnut", "ice"];
 
 /* --------------------------------------------------------------------------
    State rendering
@@ -113,7 +114,10 @@ function renderAll() {
 
   const preview = reviewPanel?.previewState() || null;
   app.preview = preview;
-  const sandbox = reviewPanel?.boardState?.() || null;
+  const sandbox =
+    reviewPanel?.boardState?.() ||
+    (app.activeTab === "import" ? editorPanel?.boardState?.() : null) ||
+    null;
   const interactive =
     !app.busy &&
     !app.navigating &&
@@ -122,11 +126,11 @@ function renderAll() {
   board.render(game, { orientation: app.orientation, canPlay: interactive, preview, sandbox });
   renderPlayers(game, app.orientation, refs.players);
   renderMoves(game, refs.moves);
+  explorer?.setGame(game);
   renderHeader(game);
   renderSession(game);
   renderModeNav(game);
   renderEval(game);
-  renderEngineStrip();
 
   panel.setGame(game);
   if (app.activeTab === "import") panel.refreshExport();
@@ -279,75 +283,6 @@ function syncArrows() {
     return;
   }
   board.setEngineArrow(evaluation.best_move);
-}
-
-function renderEngineStrip() {
-  const strip = refs.engineStrip;
-  if (!strip) return;
-  const game = app.game;
-  const engine = app.engine || (game && game.engine) || null;
-  const evaluation = app.evaluation || (game && game.evaluation) || null;
-  const wanted = Boolean(
-    game && (game.mode === "stockfish" || app.evalVisible || app.arrowsEnabled),
-  );
-  strip.hidden = !wanted;
-  if (!wanted || !engine) return;
-
-  const offline = isEngineOffline(engine);
-  const thinking = Boolean(engine.thinking);
-  const ready = engine.available && engine.status === "ready";
-  strip.classList.toggle("is-warning", offline);
-  strip.classList.toggle("is-thinking", thinking && !offline);
-  strip.title = engine.path ? `${engine.name || "Stockfish"} · ${engine.path}` : engine.note || "";
-
-  if (refs.engineStripDot) {
-    refs.engineStripDot.classList.remove("is-online", "is-pending", "is-error");
-    refs.engineStripDot.classList.add(offline ? "is-error" : ready ? "is-online" : "is-pending");
-  }
-
-  if (refs.engineStripName) {
-    if (offline) refs.engineStripName.textContent = "Stockfish offline";
-    else if (engine.status === "starting") refs.engineStripName.textContent = "Starting Stockfish";
-    else refs.engineStripName.textContent = `${engine.name || "Stockfish"}${game.mode === "stockfish" && engine.bot_elo ? ` · ${engine.bot_elo}` : ""}`;
-  }
-
-  if (refs.engineStripEval) {
-    refs.engineStripEval.textContent =
-      offline || !evaluation || !evaluation.available || !evaluation.updated_at
-        ? "—"
-        : evaluation.score_text || "0.0";
-  }
-
-  if (refs.engineStripPv) {
-    if (offline) {
-      refs.engineStripPv.textContent =
-        engine.status === "error"
-          ? engine.message || "The engine stopped unexpectedly. Open Engine setup."
-          : "Live evaluation and bot moves are offline. Open Engine setup.";
-    } else if (thinking) {
-      refs.engineStripPv.textContent = "Stockfish is thinking…";
-    } else if (evaluation && evaluation.updated_at) {
-      const pv = Array.isArray(evaluation.pv_san) ? evaluation.pv_san.slice(0, 7) : [];
-      refs.engineStripPv.textContent = pv.length ? pv.join(" ") : "No principal variation.";
-    } else if (app.evalVisible || app.arrowsEnabled) {
-      refs.engineStripPv.textContent = "Analysing the current position…";
-    } else {
-      refs.engineStripPv.textContent = "Live evaluation is off.";
-    }
-  }
-
-  if (refs.engineStripDepth) {
-    if (offline) {
-      refs.engineStripDepth.textContent = "Set path";
-    } else if (thinking) {
-      refs.engineStripDepth.textContent = `d${engine.analysis?.depth || 16}`;
-    } else if (evaluation && evaluation.updated_at) {
-      const lines = Number(evaluation.multipv) || 1;
-      refs.engineStripDepth.textContent = `d${evaluation.depth || 0} · ${lines} line${lines === 1 ? "" : "s"}${evaluation.cached ? " · cache" : ""}`;
-    } else {
-      refs.engineStripDepth.textContent = engine.available ? "Engine ready" : "Offline";
-    }
-  }
 }
 
 function applyState(state, { autoOrient = false } = {}) {
@@ -535,6 +470,76 @@ async function navigateBy(delta) {
   await navigateTo(app.game.ply + delta);
 }
 
+/** Load a UCI book line (built by the explorer) as a study game. */
+async function studyOpeningLine(pgn, label = "") {
+  if (!pgn || app.busy) return;
+  const state = await withBusy(() => call("load_pgn", pgn), {
+    successTitle: "Opening on the table",
+    successDescription: label ? `${label} is loaded for study.` : "The book line is loaded for study.",
+  });
+  if (state) tabs.setActive("moves");
+}
+
+async function launchEditorPosition({ mode, fen, playerColor }) {
+  if (!fen || app.busy) return;
+  const options = {
+    start_fen: fen,
+    event_name: mode === "stockfish" ? "Board editor - vs Stockfish" : "Board editor - Pass & Play",
+  };
+  if (mode === "stockfish") {
+    options.player_color = playerColor;
+    options.bot_pace = "blitz";
+  }
+  editorPanel?.deactivate();
+  const state = await withBusy(() => call("new_game", mode, options), {
+    successTitle: mode === "stockfish" ? "Engine match from your position" : "Position on the table",
+    successDescription:
+      mode === "stockfish"
+        ? `You play ${titleCase(playerColor)} from the edited position.`
+        : "Pass the device and play the position out.",
+    autoOrient: true,
+  });
+  if (!state) return;
+  tabs.setActive("moves");
+  if (mode === "stockfish" && !state.engine.available) {
+    toast({
+      title: "Stockfish is offline",
+      description: "The position is ready, but the bot cannot move until Engine setup points at a binary.",
+      kind: "warning",
+      duration: 7000,
+    });
+  }
+  await pushAnalysisOptions();
+  pollSoon(80);
+}
+
+async function startDrill(drillId) {
+  if (!drillId || app.busy) return;
+  const state = await withBusy(() => call("start_drill", drillId), {
+    successTitle: "Drill ready",
+    successDescription: "Play the position out against Stockfish.",
+    autoOrient: true,
+  });
+  if (!state) return;
+  tabs.setActive("moves");
+  toast({
+    title: state.drill?.title || "Drill ready",
+    description: state.drill?.goal || "Play the position out against Stockfish.",
+    kind: "info",
+    duration: 6000,
+  });
+  if (state.engine && !state.engine.available) {
+    toast({
+      title: "Stockfish is offline",
+      description: "The drill is set up, but the bot cannot move until Engine setup points at a binary.",
+      kind: "warning",
+      duration: 7000,
+    });
+  }
+  await pushAnalysisOptions();
+  pollSoon(80);
+}
+
 /* --------------------------------------------------------------------------
    Promotion
    -------------------------------------------------------------------------- */
@@ -635,6 +640,17 @@ function eloLabel(elo) {
   return band ? band[1] : "Maximum";
 }
 
+/** Clock presets pick the matching bot pace; the pills stay clickable after. */
+const PACE_BY_TIME_CONTROL = {
+  "1+0": "bullet",
+  "2+1": "bullet",
+  "3+0": "blitz",
+  "3+2": "blitz",
+  "5+0": "blitz",
+  "10+0": "rapid",
+  "15+10": "rapid",
+};
+
 function openNewGame(mode = null) {
   if (!refs.newGameDialog) return;
   const game = app.game;
@@ -656,6 +672,8 @@ function openNewGame(mode = null) {
   }
   app.newColor = game && game.mode === "stockfish" ? game.engine?.player_color || "white" : "white";
   app.newElo = game && game.mode === "stockfish" ? game.engine?.bot_elo || 1400 : 1400;
+  app.newPace =
+    game && game.mode === "stockfish" ? game.engine?.bot_pace || "blitz" : "blitz";
   const clocks = game && game.clocks;
   if (clocks && clocks.enabled && clocks.label) app.newTimeControl = clocks.label;
 
@@ -692,6 +710,12 @@ function syncNewGameForm() {
 
   for (const button of document.querySelectorAll("#new-color [data-color]")) {
     const selected = button.dataset.color === app.newColor;
+    button.classList.toggle("is-active", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  }
+
+  for (const button of document.querySelectorAll("#new-pace [data-pace]")) {
+    const selected = button.dataset.pace === app.newPace;
     button.classList.toggle("is-active", selected);
     button.setAttribute("aria-pressed", String(selected));
   }
@@ -734,6 +758,7 @@ async function startNewGame(event) {
     options = {
       player_color: app.newColor,
       bot_elo: Number(app.newElo),
+      bot_pace: app.newPace,
       human_name: human,
     };
   } else {
@@ -751,11 +776,20 @@ async function startNewGame(event) {
 
   if (mode === "stockfish") {
     const color = titleCase(state.orientation);
+    const pace = titleCase(state.engine.bot_pace || "blitz");
     toast({
       title: "Engine match ready",
-      description: `You play ${color} against Stockfish ${state.engine.bot_elo}.`,
+      description: `You play ${color} against Stockfish ${state.engine.bot_elo} · ${pace} pace.`,
       kind: "success",
     });
+    if (!state.engine.available) {
+      toast({
+        title: "Stockfish is offline",
+        description: "The table is ready, but the bot cannot move until Engine setup points at a binary.",
+        kind: "warning",
+        duration: 7000,
+      });
+    }
   } else {
     toast({
       title: "New table",
@@ -800,13 +834,34 @@ function flipBoard() {
   renderAll();
 }
 
+function applyBoardTheme(name) {
+  const theme = THEMES.includes(name) ? name : "jade";
+  document.documentElement.dataset.boardTheme = theme;
+  for (const button of document.querySelectorAll("[data-board-theme]")) {
+    button.setAttribute("aria-pressed", String(button.dataset.boardTheme === theme));
+  }
+  try {
+    localStorage.setItem(THEME_KEY, theme);
+  } catch (error) {
+    console.warn("Could not save the board theme", error);
+  }
+  return theme;
+}
+
+function storedBoardTheme() {
+  try {
+    return localStorage.getItem(THEME_KEY) || "jade";
+  } catch {
+    return "jade";
+  }
+}
+
 async function toggleEval() {
   app.evalVisible = !app.evalVisible;
   document.body.classList.toggle("eval-hidden", !app.evalVisible);
   const button = document.querySelector('[data-action="eval"]');
   if (button) button.setAttribute("aria-pressed", String(app.evalVisible));
   renderEval(app.game);
-  renderEngineStrip();
   syncArrows();
   await pushAnalysisOptions();
   pollSoon(60);
@@ -833,7 +888,6 @@ async function toggleArrows() {
   const button = document.querySelector('[data-action="arrows"]');
   if (button) button.setAttribute("aria-pressed", String(app.arrowsEnabled));
   syncArrows();
-  renderEngineStrip();
   if (app.arrowsEnabled && isEngineOffline(app.engine)) {
     toast({
       title: "Stockfish is offline",
@@ -1036,6 +1090,7 @@ function wireShell() {
     ink: $("tab-ink"),
     onChange: (name) => {
       app.activeTab = name;
+      if (editorPanel?.isActive()) renderAll();
       if (name !== "review") reviewPanel?.exitRetry();
       if (name === "import") panel?.refreshExport();
       if (name === "history") historyPanel?.refresh();
@@ -1055,6 +1110,26 @@ function wireShell() {
   panel = new ImportPanel({
     onGameChanged: (state) => applyState(state),
     onTabRequested: (name) => tabs.setActive(name),
+  });
+
+  editorPanel = new EditorPanel({
+    onChange: () => renderAll(),
+    onLaunch: (payload) => launchEditorPosition(payload),
+    onFlip: () => flipBoard(),
+    onStartDrill: (drillId) => startDrill(drillId),
+  });
+
+  refs.board.addEventListener("click", (event) => {
+    if (!editorPanel?.isActive() || app.activeTab !== "import") return;
+    const square = board?.squareAt(event.clientX, event.clientY);
+    if (square) editorPanel.handleSquare(square);
+  });
+
+  explorer = new OpeningExplorer({
+    onPlay: (uci) => playMove(uci),
+    onStudyLine: (pgn, label) => studyOpeningLine(pgn, label),
+    onHoverArrow: (arrow) => board?.setArrows([{ ...arrow, brush: "alternative" }]),
+    onClearArrow: () => syncArrows(),
   });
 
   reviewPanel = new ReviewPanel({
@@ -1095,7 +1170,6 @@ function wireShell() {
   $("engine-form")?.addEventListener("submit", configureEngine);
   $("btn-engine-auto")?.addEventListener("click", autoDetectEngine);
   $("btn-engine-config")?.addEventListener("click", openEngineDialog);
-  $("btn-engine-strip-config")?.addEventListener("click", openEngineDialog);
 
   for (const closer of document.querySelectorAll("[data-close-dialog]")) {
     closer.addEventListener("click", () => closeDialog(closer.closest("dialog")));
@@ -1115,6 +1189,13 @@ function wireShell() {
   for (const button of document.querySelectorAll("#new-time-control [data-time-control]")) {
     button.addEventListener("click", () => {
       app.newTimeControl = button.dataset.timeControl;
+      app.newPace = PACE_BY_TIME_CONTROL[app.newTimeControl] || app.newPace;
+      syncNewGameForm();
+    });
+  }
+  for (const button of document.querySelectorAll("#new-pace [data-pace]")) {
+    button.addEventListener("click", () => {
+      app.newPace = button.dataset.pace;
       syncNewGameForm();
     });
   }
@@ -1169,6 +1250,11 @@ function wireShell() {
     });
   });
 
+  applyBoardTheme(storedBoardTheme());
+  for (const button of document.querySelectorAll("[data-board-theme]")) {
+    button.addEventListener("click", () => applyBoardTheme(button.dataset.boardTheme));
+  }
+
   refs.promotionOptions?.addEventListener("click", (event) => {
     const button = event.target.closest("[data-promotion]");
     if (button) choosePromotion(button.dataset.promotion);
@@ -1216,6 +1302,15 @@ function wireShell() {
     showRetrySolution: () => reviewPanel?.showSolution(),
     getRetryState: () => reviewPanel?.retryState() || null,
     getHistoryPanel: () => historyPanel,
+    getOpeningExplorer: () => explorer,
+    getOpeningData: () => explorer?.data || null,
+    getEditorPanel: () => editorPanel,
+    getDrills: () => editorPanel?.drills || [],
+    startDrill: (drillId) => call("start_drill", drillId),
+    launchEditorPosition,
+    searchOpenings: (query, ecoPrefix, limit) => call("search_openings", query, ecoPrefix, limit),
+    studyOpeningLine,
+    setBoardTheme: (name) => applyBoardTheme(name),
     getHistoryData: () => historyPanel?.data || null,
     refreshHistory: () => historyPanel?.refresh({ silent: true }),
     refreshHistoryCount: () => historyPanel?.refreshCount(),
@@ -1341,10 +1436,11 @@ async function bootstrap() {
   bridgeStatus("pending");
   try {
     app.bridgeMode = await connect();
-    const [info, state, samples] = await Promise.all([
+    const [info, state, samples, drills] = await Promise.all([
       call("get_api_info"),
       call("get_game_state"),
       call("get_samples"),
+      call("get_drills"),
     ]);
 
     app.apiInfo = info;
@@ -1352,6 +1448,7 @@ async function bootstrap() {
     app.bridgeMode = app.bridgeMode || (window.pywebview ? "native" : "http");
 
     if (panel) panel.setSamples(app.samples);
+    editorPanel?.setDrills(drills && Array.isArray(drills.drills) ? drills.drills : []);
     if (state) applyState(state);
     historyPanel?.refreshCount();
     bridgeStatus("ready", info);

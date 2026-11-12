@@ -215,6 +215,20 @@ export class BoardController {
     this.setArrows([]);
   }
 
+  /** Square under a viewport point, for the board editor. */
+  squareAt(clientX, clientY) {
+    const boardElement = this.element.querySelector("cg-board");
+    if (!boardElement) return null;
+    const rect = boardElement.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    const col = Math.floor(((clientX - rect.left) / rect.width) * 8);
+    const row = Math.floor(((clientY - rect.top) / rect.height) * 8);
+    if (col < 0 || col > 7 || row < 0 || row > 7) return null;
+    const file = this.orientation === "black" ? 7 - col : col;
+    const rank = this.orientation === "black" ? row : 7 - row;
+    return `${"abcdefgh"[file]}${rank + 1}`;
+  }
+
   squareBox(square) {
     const boardElement = this.element.querySelector("cg-board") || this.element;
     const boardRect = boardElement.getBoundingClientRect();

@@ -29,6 +29,7 @@ GAME_COLUMNS: tuple[str, ...] = (
     "white_name",
     "black_name",
     "bot_elo",
+    "bot_pace",
     "player_color",
     "time_control",
     "result",
@@ -83,6 +84,7 @@ CREATE TABLE IF NOT EXISTS games (
     white_name TEXT,
     black_name TEXT,
     bot_elo INTEGER,
+    bot_pace TEXT,
     player_color TEXT,
     time_control TEXT,
     result TEXT,
@@ -145,7 +147,16 @@ class GameStore:
             if self.path != ":memory:":
                 self._conn.execute("PRAGMA journal_mode = WAL")
             self._conn.executescript(_SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database file was first created."""
+
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(games)")}
+        for column in GAME_COLUMNS:
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE games ADD COLUMN {column} TEXT")
 
     # -- games -----------------------------------------------------------
     def upsert_game(self, record: Mapping[str, Any]) -> dict[str, Any]:

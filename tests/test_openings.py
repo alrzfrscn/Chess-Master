@@ -117,6 +117,92 @@ def test_polyglot_missing_file_is_rejected(tmp_path) -> None:
         OpeningBook(lines=[], polyglot_path=tmp_path / "book.bin")
 
 
+def test_explore_lists_book_continuations_from_the_start() -> None:
+    data = get_default_book().explore([])
+    assert data["in_book"] is True
+    assert data["current"] == {
+        "eco": None,
+        "name": "Starting position",
+        "variation": None,
+        "full_name": "Starting position",
+        "last_book_ply": 0,
+    }
+    moves = data["continuations"]
+    assert {"e2e4", "d2d4", "g1f3", "c2c4"}.issubset({item["uci"] for item in moves})
+    counts = [item["line_count"] for item in moves]
+    assert counts == sorted(counts, reverse=True)
+    assert all(item["line_count"] > 0 for item in moves)
+    expected_keys = {
+        "uci",
+        "san",
+        "from",
+        "to",
+        "eco",
+        "name",
+        "variation",
+        "full_name",
+        "line_count",
+        "share_pct",
+    }
+    assert all(expected_keys.issubset(item) for item in moves)
+    assert abs(sum(item["share_pct"] for item in moves) - 100.0) < 1.5
+
+
+def test_explore_follows_the_prefix_into_the_book() -> None:
+    data = get_default_book().explore(["e2e4", "e7e5", "g1f3", "b8c6", "f1c4"])
+    assert data["in_book"] is True
+    assert data["current"]["eco"] == "C50"
+    assert data["current"]["full_name"].startswith("Italian Game")
+    assert data["current"]["last_book_ply"] == 5
+
+    best = data["continuations"][0]
+    assert best["uci"] == "f8c5"
+    assert best["san"] == "Bc5"
+    assert best["from"] == "f8" and best["to"] == "c5"
+    assert best["full_name"] == "Italian Game: Giuoco Piano"
+    assert best["line_count"] > 0
+    assert best["share_pct"] > 50
+
+
+def test_explore_off_book_position_reports_no_continuations() -> None:
+    data = get_default_book().explore(["e2e4", "e7e5", "g1f3", "b8c6", "f1c4", "a7a5"])
+    assert data["in_book"] is False
+    assert data["continuations"] == []
+    assert data["current"]["eco"] == "C50"
+
+
+def test_explore_reenters_the_book_by_transposition() -> None:
+    # Nimzo-Indian via 1.c4 e6 2.Nc3 Nf6 3.d4 Bb4, then find the EPD match.
+    data = get_default_book().explore(["c2c4", "e7e6", "b1c3", "g8f6", "d2d4", "f8b4"])
+    assert data["transposed"] is True
+    assert data["in_book"] is True
+    assert data["current"]["eco"] == "E20"
+    assert data["current"]["full_name"].startswith("Nimzo-Indian")
+    assert data["continuations"]
+
+
+def test_search_openings_by_name_and_eco() -> None:
+    book = get_default_book()
+
+    sicilian = book.search_openings("sicilian", limit=5)
+    assert len(sicilian) == 5
+    assert all("sicilian" in line["full_name"].lower() for line in sicilian)
+
+    najdorf = book.search_openings("Najdorf")
+    assert najdorf
+    assert all("najdorf" in line["full_name"].lower() for line in najdorf)
+
+    eco_lines = book.search_openings(eco_prefix="B90")
+    assert eco_lines
+    assert all(line["eco"] == "B90" for line in eco_lines)
+    expected_keys = {"eco", "name", "variation", "full_name", "uci_line", "ply_count", "epd"}
+    assert all(expected_keys.issubset(line) for line in eco_lines)
+    assert eco_lines[0]["ply_count"] == len(eco_lines[0]["uci_line"].split())
+
+    assert len(book.search_openings(eco_prefix="B90", limit=2)) == 2
+    assert book.search_openings("no-such-opening-name") == []
+
+
 def test_opening_info_marks_polyglot_only_lines() -> None:
     info = OpeningInfo(
         eco=None,

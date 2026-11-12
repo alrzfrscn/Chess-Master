@@ -8,12 +8,13 @@ import pytest
 from chess_master.engine.errors import (
     GameOverError,
     IllegalMoveError,
+    InvalidFenError,
     InvalidInputError,
     InvalidModeError,
     InvalidPlyError,
     PromotionRequiredError,
 )
-from chess_master.engine.game import GameSession
+from chess_master.engine.game import GameSession, bot_pace_for_time_control
 
 
 def test_new_game_state() -> None:
@@ -83,6 +84,31 @@ def test_stockfish_human_name_tracks_the_resolved_color() -> None:
 def test_invalid_mode_is_rejected() -> None:
     with pytest.raises(InvalidModeError):
         GameSession.new_game("teleport")
+
+
+def test_bot_pace_defaults_to_instant_and_validates() -> None:
+    default = GameSession.new_game("stockfish", {"bot_elo": 1200}).to_state()
+    assert default["engine"]["bot_pace"] == "instant"
+
+    chosen = GameSession.new_game(
+        "stockfish", {"bot_elo": 1200, "bot_pace": " Blitz "}
+    ).to_state()
+    assert chosen["engine"]["bot_pace"] == "blitz"
+
+    with pytest.raises(InvalidInputError):
+        GameSession.new_game("stockfish", {"bot_pace": "warp"})
+
+
+def test_bot_pace_follows_the_clock_category() -> None:
+    assert bot_pace_for_time_control("1+0") == "bullet"
+    assert bot_pace_for_time_control("2+1") == "bullet"
+    assert bot_pace_for_time_control("3+0") == "blitz"
+    assert bot_pace_for_time_control("3+2") == "blitz"
+    assert bot_pace_for_time_control("5+0") == "blitz"
+    assert bot_pace_for_time_control("10+0") == "rapid"
+    assert bot_pace_for_time_control("15+10") == "rapid"
+    assert bot_pace_for_time_control("unlimited") == "instant"
+    assert bot_pace_for_time_control(None) == "instant"
 
 
 def test_make_move_accepts_san_and_uci() -> None:
@@ -292,3 +318,81 @@ def test_move_ucis_preserves_full_history() -> None:
     session.make_move("Nf3")
     assert session.move_ucis() == ["e2e4", "e7e5", "g1f3"]
     assert session.move_ucis(2) == ["e2e4", "e7e5"]
+
+
+CUSTOM_ROOK_FEN = "8/8/8/4k3/8/8/8/4K2R w - - 0 1"
+CUSTOM_ROOK_FEN_BLACK = "8/8/8/4k3/8/8/8/4K2R b - - 0 1"
+
+
+def test_new_game_accepts_a_custom_start_fen() -> None:
+    session = GameSession.new_game(
+        "pass_play",
+        {"start_fen": CUSTOM_ROOK_FEN, "event_name": "Board editor"},
+    )
+    state = session.to_state()
+
+    assert state["start_fen"] == CUSTOM_ROOK_FEN
+    assert state["fen"] == CUSTOM_ROOK_FEN
+    assert state["headers"]["SetUp"] == "1"
+    assert state["headers"]["FEN"] == CUSTOM_ROOK_FEN
+    assert state["event"] == "Board editor"
+    assert state["turn"] == "white"
+
+    session.make_move("Rh5")
+    exported = session.export_pgn()["pgn"]
+    assert '[SetUp "1"]' in exported
+    assert f'[FEN "{CUSTOM_ROOK_FEN}"]' in exported
+    assert "1. Rh5" in exported
+
+    assert session.reset()["fen"] == CUSTOM_ROOK_FEN
+
+
+def test_new_game_plain_start_has_no_setup_headers() -> None:
+    session = GameSession.new_game("pass_play")
+    headers = session.to_state()["headers"]
+    assert "SetUp" not in headers
+    assert "FEN" not in headers
+
+
+def test_new_game_rejects_an_illegal_start_fen() -> None:
+    with pytest.raises(InvalidFenError):
+        GameSession.new_game("stockfish", {"start_fen": "8/8/8/8/8/8/8/8 w - - 0 1"})
+
+
+def test_stockfish_custom_fen_with_white_to_move() -> None:
+    session = GameSession.new_game(
+        "stockfish",
+        {"start_fen": CUSTOM_ROOK_FEN, "player_color": "white", "bot_elo": 1200},
+    )
+    state = session.to_state()
+
+    assert state["start_fen"] == CUSTOM_ROOK_FEN
+    assert state["turn"] == "white"
+    assert state["engine"]["player_color"] == "white"
+    assert state["engine"]["bot_color"] == "black"
+    assert state["players"]["black"]["is_engine"] is True
+    assert state["fen"] == CUSTOM_ROOK_FEN
+
+    moved = session.make_move("Rh5")
+    assert moved["turn"] == "black"
+    assert moved["moves"][0]["uci"] == "h1h5"
+
+
+def test_stockfish_custom_fen_with_black_to_move() -> None:
+    session = GameSession.new_game(
+        "stockfish",
+        {"start_fen": CUSTOM_ROOK_FEN_BLACK, "player_color": "black", "bot_elo": 1200},
+    )
+    state = session.to_state()
+
+    assert state["start_fen"] == CUSTOM_ROOK_FEN_BLACK
+    assert state["turn"] == "black"
+    assert state["engine"]["player_color"] == "black"
+    assert state["engine"]["bot_color"] == "white"
+    assert state["orientation"] == "black"
+    assert state["players"]["white"]["is_engine"] is True
+
+    moved = session.make_move("Kf6")
+    assert moved["turn"] == "white"
+    assert moved["moves"][0]["san"] == "Kf6"
+

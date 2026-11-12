@@ -143,6 +143,7 @@ class OpeningBook:
         for move in line.uci:
             children = node["children"]
             node = children.setdefault(move, {"children": {}})
+            node["lines"] = int(node.get("lines") or 0) + 1
         if not node.get("eco"):
             node.update(
                 {
@@ -264,6 +265,149 @@ class OpeningBook:
     def is_book_move(self, moves: Sequence[str], ply: int) -> bool:
         info = self.detect(moves[: max(0, int(ply))])
         return int(ply) <= info.last_book_ply
+
+    # -- explorer --------------------------------------------------------
+    @staticmethod
+    def _board_from(fen: str | None, uci: Sequence[str]) -> chess.Board:
+        board = chess.Board(fen) if fen else chess.Board()
+        for move_text in uci:
+            try:
+                move = chess.Move.from_uci(str(move_text))
+            except ValueError:
+                break
+            if move not in board.legal_moves:
+                break
+            board.push(move)
+        return board
+
+    def _walk(self, uci: Sequence[str]) -> tuple[dict[str, Any], dict[str, Any] | None, int]:
+        """Return the deepest trie node reached, its deepest named ancestor and depth."""
+
+        node = self._root
+        best: dict[str, Any] | None = None
+        depth = 0
+        for index, move in enumerate(uci, start=1):
+            child = node.get("children", {}).get(str(move))
+            if child is None:
+                break
+            node = child
+            depth = index
+            if child.get("eco"):
+                best = child
+        return node, best, depth
+
+    @staticmethod
+    def _node_info(node: dict[str, Any], last_book_ply: int) -> dict[str, Any]:
+        full_name = str(node.get("full_name") or node.get("name") or "")
+        return {
+            "eco": node.get("eco"),
+            "name": full_name.split(":", 1)[0].strip(),
+            "variation": node.get("variation"),
+            "full_name": full_name,
+            "last_book_ply": int(last_book_ply),
+        }
+
+    def explore(self, moves: Sequence[str], fen: str | None = None) -> dict[str, Any]:
+        """Book continuations for the position after a UCI prefix.
+
+        ``fen`` lets a session restore a transposed position: when the prefix
+        leaves the trie, a known EPD match re-enters it at the matching node.
+        """
+
+        uci = tuple(str(move) for move in moves)
+        node, best, depth = self._walk(uci)
+        board = self._board_from(fen, uci)
+        transposed_line: OpeningLine | None = None
+        if depth < len(uci) or best is None:
+            transposed_line = self.lookup_position(board)
+            if transposed_line is not None:
+                node, matched, _ = self._walk(transposed_line.uci)
+                if matched is not None:
+                    best, depth, board = matched, len(uci), self._board_from(None, transposed_line.uci)
+                else:
+                    transposed_line = None
+
+        if best is None:
+            name = "Starting position" if not uci else "Out of book"
+            current = {
+                "eco": None,
+                "name": name,
+                "variation": None,
+                "full_name": name,
+                "last_book_ply": 0,
+            }
+        else:
+            current = self._node_info(best, depth)
+
+        children = node.get("children", {})
+        continuations: list[dict[str, Any]] = []
+        for move_text, child in children.items():
+            try:
+                move = chess.Move.from_uci(move_text)
+            except ValueError:
+                continue
+            if move not in board.legal_moves:
+                continue
+            branch = self._node_info(child, depth + 1) if child.get("eco") else {
+                "eco": current["eco"],
+                "name": current["name"],
+                "variation": current["variation"],
+                "full_name": current["full_name"],
+            }
+            continuations.append(
+                {
+                    "uci": move_text,
+                    "san": board.san(move),
+                    "from": chess.square_name(move.from_square),
+                    "to": chess.square_name(move.to_square),
+                    "eco": branch["eco"],
+                    "name": branch["name"],
+                    "variation": branch["variation"],
+                    "full_name": branch["full_name"],
+                    "line_count": int(child.get("lines") or 0),
+                }
+            )
+
+        total = sum(item["line_count"] for item in continuations) or 1
+        for item in continuations:
+            item["share_pct"] = round(item["line_count"] * 100.0 / total, 1)
+        continuations.sort(key=lambda item: (-item["line_count"], item["san"]))
+
+        return {
+            "in_book": depth == len(uci),
+            "current": current,
+            "continuations": continuations,
+            "transposed": bool(transposed_line),
+        }
+
+    def search_openings(
+        self, query: str = "", eco_prefix: str = "", limit: int = 40
+    ) -> list[dict[str, Any]]:
+        """Search the bundled ECO lines by name fragment or ECO code."""
+
+        needle = str(query or "").strip().lower()
+        prefix = str(eco_prefix or "").strip().upper()
+        cap = max(1, min(int(limit), 200))
+        results: list[dict[str, Any]] = []
+        for line in self.lines:
+            if prefix and not line.eco.upper().startswith(prefix):
+                continue
+            if needle and needle not in line.name.lower() and needle not in line.eco.lower():
+                continue
+            results.append(
+                {
+                    "eco": line.eco,
+                    "name": line.family,
+                    "variation": line.variation,
+                    "full_name": line.name,
+                    "uci_line": " ".join(line.uci),
+                    "ply_count": len(line.uci),
+                    "epd": line.epd,
+                }
+            )
+            if len(results) >= cap:
+                break
+        return results
 
     def stats(self) -> dict[str, Any]:
         return {

@@ -30,12 +30,25 @@ from chess_master.engine.replay import capture_on_move, replay_board
 from chess_master.engine.status import position_status, result_from_status
 from chess_master.models.game import MoveRecord, PlayerInfo
 
-__all__ = ["GameSession", "VALID_MODES", "MIN_BOT_ELO", "MAX_BOT_ELO"]
+__all__ = [
+    "GameSession",
+    "VALID_MODES",
+    "MIN_BOT_ELO",
+    "MAX_BOT_ELO",
+    "BOT_PACES",
+    "DEFAULT_BOT_PACE",
+    "bot_pace_for_time_control",
+]
 
 VALID_MODES = ("pass_play", "stockfish")
 MIN_BOT_ELO = 400
 MAX_BOT_ELO = 3000
 DEFAULT_BOT_ELO = 1400
+BOT_PACES = ("instant", "bullet", "blitz", "rapid")
+# Tests and programmatic callers that do not ask for a pace keep the old
+# instant replies; the UI passes "blitz" (or the clock's pace) explicitly.
+DEFAULT_BOT_PACE = "instant"
+_PACE_BY_CLOCK_CATEGORY = {"bullet": "bullet", "blitz": "blitz", "rapid": "rapid"}
 _PLAYER_COLORS = ("white", "black", "random")
 _UCI_RE = re.compile(r"^[a-h][1-8][a-h][1-8][qrbn]?$")
 _PROMOTION_ORDER = ("q", "r", "b", "n")
@@ -140,6 +153,34 @@ def _engine_label(elo: int) -> str:
     return strength_label(elo)
 
 
+def _coerce_bot_pace(value: Any) -> str:
+    if value is None:
+        return DEFAULT_BOT_PACE
+    if not isinstance(value, str):
+        raise InvalidInputError(
+            "Bot pace must be instant, bullet, blitz or rapid.",
+            details={"bot_pace": value, "valid": list(BOT_PACES)},
+        )
+    pace = value.strip().lower()
+    if pace not in BOT_PACES:
+        raise InvalidInputError(
+            "Bot pace must be instant, bullet, blitz or rapid.",
+            details={"bot_pace": value, "valid": list(BOT_PACES)},
+        )
+    return pace
+
+
+def bot_pace_for_time_control(value: Any) -> str:
+    """Mirror a clock preset/category onto a bot pace; unlimited stays instant."""
+
+    try:
+        control = resolve_time_control(value)
+    except InvalidInputError:
+        return DEFAULT_BOT_PACE
+    if control is None:
+        return DEFAULT_BOT_PACE
+    return _PACE_BY_CLOCK_CATEGORY.get(control.category, DEFAULT_BOT_PACE)
+
 
 class GameSession:
     """A single game table.
@@ -200,6 +241,7 @@ class GameSession:
         self._engine_player_color: str | None = None
         self._engine_bot_color: str | None = None
         self._engine_bot_elo: int | None = None
+        self._engine_bot_pace: str | None = None
         self.revision = 1
         self._view_ply = len(self._moves)
         self._board = replay_board(self._start_fen, self._moves, self._view_ply)
@@ -225,7 +267,16 @@ class GameSession:
         else:
             player_color = requested_color
 
+        raw_start_fen = options.get("start_fen")
+        if raw_start_fen is None:
+            start_fen = chess.STARTING_FEN
+        else:
+            if not isinstance(raw_start_fen, str):
+                raise InvalidInputError("The starting position must be a FEN string.")
+            start_fen = validate_fen(raw_start_fen).fen()
+
         bot_elo = _coerce_bot_elo(options.get("bot_elo")) if mode == "stockfish" else None
+        bot_pace = _coerce_bot_pace(options.get("bot_pace")) if mode == "stockfish" else None
         bot_color = _opposite(player_color) if mode == "stockfish" else None
         bot_name = f"Stockfish {bot_elo}" if bot_elo is not None else "Stockfish"
         human_name = _clean_name(options.get("human_name"), "Player")
@@ -259,9 +310,13 @@ class GameSession:
         )
 
         today = datetime.now(timezone.utc).strftime("%Y.%m.%d")
-        event = "Chess Master - Pass & Play" if mode == "pass_play" else "Chess Master - Play vs Stockfish"
+        default_event = (
+            "Chess Master - Pass & Play"
+            if mode == "pass_play"
+            else "Chess Master - Play vs Stockfish"
+        )
         headers = {
-            "Event": event,
+            "Event": _clean_name(options.get("event_name"), default_event),
             "Site": "Chess Master",
             "Date": today,
             "Round": "1",
@@ -269,9 +324,12 @@ class GameSession:
             "Black": black.name,
             "Result": "*",
         }
+        if start_fen != chess.STARTING_FEN:
+            headers["SetUp"] = "1"
+            headers["FEN"] = start_fen
         session = cls(
             mode=mode,
-            start_fen=chess.STARTING_FEN,
+            start_fen=start_fen,
             headers=headers,
             players={"white": white, "black": black},
             source="new",
@@ -280,6 +338,7 @@ class GameSession:
         session._engine_player_color = player_color if mode == "stockfish" else None
         session._engine_bot_color = bot_color
         session._engine_bot_elo = bot_elo
+        session._engine_bot_pace = bot_pace
         return session
 
     @classmethod
@@ -446,6 +505,11 @@ class GameSession:
         session._engine_player_color = player_color if mode == "stockfish" else None
         session._engine_bot_color = bot_color
         session._engine_bot_elo = int(bot_elo) if bot_elo else None
+        try:
+            pace = _coerce_bot_pace(record.get("bot_pace"))
+        except InvalidInputError:
+            pace = DEFAULT_BOT_PACE
+        session._engine_bot_pace = pace if mode == "stockfish" else DEFAULT_BOT_PACE
         return session
 
     # ------------------------------------------------------------------
@@ -474,6 +538,10 @@ class GameSession:
     @property
     def engine_bot_elo(self) -> int | None:
         return self._engine_bot_elo
+
+    @property
+    def bot_pace(self) -> str:
+        return self._engine_bot_pace or DEFAULT_BOT_PACE
 
     @property
     def total_plies(self) -> int:
@@ -805,6 +873,7 @@ class GameSession:
             "white_name": self._players["white"].name,
             "black_name": self._players["black"].name,
             "bot_elo": self._engine_bot_elo,
+            "bot_pace": self._engine_bot_pace,
             "player_color": self._engine_player_color,
             "time_control": self.time_control,
             "result": result_from_status(status, self._headers.get("Result", "*")),
@@ -844,6 +913,7 @@ class GameSession:
             "player_color": self._engine_player_color,
             "bot_color": self._engine_bot_color,
             "bot_elo": self._engine_bot_elo,
+            "bot_pace": self.bot_pace if enabled else None,
             "thinking": False,
             "analysis": {"enabled": False, "arrows": False, "depth": 16, "multipv": 3},
         }

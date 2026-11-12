@@ -232,3 +232,48 @@ def test_engine_status_reports_cache_and_worker(api: ChessMasterApi) -> None:
     assert status["cache"]["entries"] >= 1
     assert status["model"]["winprob"] == "lichess-logistic"
     assert status["engine"]["jobs"]["running"] in {None, "analysis", "bot"}
+
+
+ROOK_FEN = "8/8/8/4k3/8/8/8/4K2R w - - 0 1"
+ROOK_FEN_BLACK_TO_MOVE = "8/8/8/4k3/8/8/8/4K2R b - - 0 1"
+
+
+def test_custom_fen_white_to_move_gets_a_bot_reply(api: ChessMasterApi) -> None:
+    state = data(
+        api.new_game(
+            "stockfish",
+            {"start_fen": ROOK_FEN, "player_color": "white", "bot_elo": 800},
+        )
+    )
+    assert state["start_fen"] == ROOK_FEN
+    assert state["turn"] == "white"
+
+    data(api.make_move("h1h5"))
+    result = wait_for_poll(api, lambda payload: payload["moved"] is not None)
+    assert result["state"]["total_plies"] == 2
+    assert result["state"]["last_move"]["color"] == "black"
+    board = chess.Board(ROOK_FEN)
+    board.push_uci("h1h5")
+    assert chess.Move.from_uci(result["moved"]) in board.legal_moves
+
+
+def test_custom_fen_black_to_move_the_bot_moves_first(api: ChessMasterApi) -> None:
+    state = data(
+        api.new_game(
+            "stockfish",
+            {"start_fen": ROOK_FEN_BLACK_TO_MOVE, "player_color": "white", "bot_elo": 800},
+        )
+    )
+    assert state["start_fen"] == ROOK_FEN_BLACK_TO_MOVE
+    assert state["turn"] == "black"
+    assert state["orientation"] == "white"
+    assert state["engine"]["bot_color"] == "black"
+
+    result = wait_for_poll(api, lambda payload: payload["moved"] is not None)
+    assert result["state"]["total_plies"] == 1
+    assert result["state"]["last_move"]["color"] == "black"
+    assert (
+        chess.Move.from_uci(result["moved"])
+        in chess.Board(ROOK_FEN_BLACK_TO_MOVE).legal_moves
+    )
+

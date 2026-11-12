@@ -1,9 +1,11 @@
-"""Coordinator policy: engine errors and review-aware scheduling."""
+"""Coordinator policy: engine errors, pacing and review-aware scheduling."""
 
 from __future__ import annotations
 
+import time
+
 from chess_master.analysis.review import line_signature
-from chess_master.engine.coordinator import EngineCoordinator
+from chess_master.engine.coordinator import EngineCoordinator, bot_move_delay
 from chess_master.engine.game import GameSession
 
 
@@ -25,6 +27,15 @@ class FakeWorker:
     def cancel_review(self) -> bool:
         self.cancelled_reviews += 1
         return True
+
+    def status_payload(self) -> dict:
+        return {
+            "available": True,
+            "status": "ready",
+            "name": "Stockfish",
+            "version": "test",
+            "jobs": {},
+        }
 
 
 def _running_review(session: GameSession) -> dict:
@@ -82,3 +93,41 @@ def test_sync_cancels_the_review_when_it_is_the_bots_turn(monkeypatch) -> None:
     assert worker.cancelled_reviews == 1
     assert coordinator._review is not None
     assert coordinator._review["status"] == "cancelled"
+
+
+def test_completed_bot_move_is_held_until_the_pace_gate() -> None:
+    session = GameSession.new_game(
+        "stockfish", {"player_color": "white", "bot_elo": 800, "bot_pace": "bullet"}
+    )
+    session.make_move("e4")
+    coordinator = EngineCoordinator(worker=FakeWorker())
+    token = coordinator.token_for(session)
+    coordinator._token = token
+    coordinator._bot_scheduled = token
+    coordinator._thinking = True
+    coordinator._pending_bot = {"token": token, "uci": "e7e5", "analysis": {}}
+    coordinator._bot_ready_at = time.monotonic() + 0.15
+
+    assert coordinator.take_pending_bot(session) is None
+    assert coordinator.engine_payload(session)["thinking"] is True
+
+    time.sleep(0.16)
+    assert coordinator.take_pending_bot(session) == "e7e5"
+    assert coordinator.engine_payload(session)["thinking"] is False
+
+
+def test_low_bot_clock_shortens_the_delay() -> None:
+    session = GameSession.new_game(
+        "stockfish",
+        {"player_color": "white", "bot_elo": 800, "bot_pace": "rapid", "time_control": "1+0"},
+    )
+    assert session.clock is not None
+
+    session.clock.black_ms = 9_000
+    assert all(0.18 <= bot_move_delay(session) <= 0.26 for _ in range(40))
+
+    session.clock.black_ms = 24_000
+    assert all(0.35 <= bot_move_delay(session) <= 0.55 for _ in range(40))
+
+    session.clock.black_ms = 60_000
+    assert all(1.5 <= bot_move_delay(session) <= 2.5 for _ in range(40))

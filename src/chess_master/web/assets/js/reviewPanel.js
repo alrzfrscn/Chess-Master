@@ -197,6 +197,7 @@ export class ReviewPanel {
       runLabel: document.getElementById("review-run-label"),
       cancel: document.getElementById("btn-cancel-review"),
       reviewAgain: document.getElementById("btn-review-again"),
+      exportCard: document.getElementById("btn-export-card"),
       progress: document.getElementById("review-progress"),
       progressPhase: document.getElementById("review-progress-phase"),
       progressCount: document.getElementById("review-progress-count"),
@@ -266,6 +267,7 @@ export class ReviewPanel {
     this.refs.run?.addEventListener("click", () => this.start());
     this.refs.cancel?.addEventListener("click", () => this.cancel());
     this.refs.reviewAgain?.addEventListener("click", () => this.start());
+    this.refs.exportCard?.addEventListener("click", () => this.exportCard());
     this.refs.moveList?.addEventListener("click", (event) => {
       const row = event.target.closest("[data-review-ply]");
       if (!row) return;
@@ -1310,6 +1312,210 @@ export class ReviewPanel {
       card.append(head, accuracyRow, stats, phases);
       container.append(card);
     }
+  }
+
+  /* --------------------------------------------------------------------
+     Shareable review card
+     -------------------------------------------------------------------- */
+
+  async exportCard() {
+    if (!this.report) return;
+    const button = this.refs.exportCard;
+    if (button) button.disabled = true;
+    try {
+      if (document.fonts?.ready) await document.fonts.ready;
+      const canvas = this.drawCard();
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+      if (!blob) throw new Error("The canvas could not be exported.");
+      const filename = `chess-master-review-${this.game?.game_id || this.report.signature || "game"}.png`;
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 5000);
+      toast({ title: "Review card exported", description: filename, kind: "success" });
+    } catch (error) {
+      toast({ title: "Could not export the card", description: errorMessage(error), kind: "error" });
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  /** Draw a self-contained 1200×630 card: header, players, curve, counts. */
+  drawCard() {
+    const width = 1200;
+    const height = 630;
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return canvas;
+
+    const report = this.report || {};
+    const summary = report.summary || {};
+    const counts = report.totals?.counts || summary.counts || {};
+    const opening = report.opening || {};
+    const cardPlayers = report.players || {};
+    const gamePlayers = this.game?.players || {};
+    const mono = '"Fira Code", ui-monospace, monospace';
+    const sans = '"Fira Sans", system-ui, sans-serif';
+    const styles = getComputedStyle(document.documentElement);
+    const classColor = (key) =>
+      (styles.getPropertyValue(`--class-${key}`) || "").trim() || "#8d99a5";
+    const clamp = (value) => Math.max(0, Math.min(100, Number(value) || 0));
+
+    const round = (x, y, w, h, r, fill, stroke) => {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+      if (fill) {
+        ctx.fillStyle = fill;
+        ctx.fill();
+      }
+      if (stroke) {
+        ctx.strokeStyle = stroke;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+    };
+    const write = (value, x, y, size, weight, color, align = "left", family = sans) => {
+      ctx.font = `${weight} ${size}px ${family}`;
+      ctx.fillStyle = color;
+      ctx.textAlign = align;
+      ctx.textBaseline = "alphabetic";
+      ctx.fillText(String(value ?? ""), x, y);
+    };
+
+    const bg = ctx.createLinearGradient(0, 0, width, height);
+    bg.addColorStop(0, "#0a0f13");
+    bg.addColorStop(0.55, "#0b1418");
+    bg.addColorStop(1, "#0d1a16");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, width, height);
+    const glow = ctx.createRadialGradient(940, 0, 30, 940, 0, 620);
+    glow.addColorStop(0, "rgba(95, 215, 164, 0.16)");
+    glow.addColorStop(1, "rgba(95, 215, 164, 0)");
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, 0, width, height);
+    ctx.fillStyle = "#5fd7a4";
+    ctx.fillRect(0, 0, width, 6);
+
+    write("CHESS MASTER", 60, 62, 15, 600, "#5fd7a4", "left", mono);
+    write("Game Review", 60, 104, 36, 700, "#e8edf1");
+    const game = this.game || {};
+    const date = String(game.created_at || game.headers?.Date || new Date().toISOString())
+      .slice(0, 10)
+      .replace(/-/g, ".");
+    write(date, 1140, 58, 13, 500, "#b2bcc6", "right", mono);
+    write(game.mode_label || "Chess Master game", 1140, 82, 13, 500, "#8d99a5", "right", mono);
+
+    round(60, 124, 1080, 52, 12, "rgba(95, 215, 164, 0.06)", "rgba(95, 215, 164, 0.18)");
+    write(opening.eco || "—", 82, 157, 16, 600, "#5fd7a4", "left", mono);
+    write(opening.full_name || opening.name || "Unknown opening", 142, 157, 17, 500, "#e8edf1");
+    write("OPENING", 1120, 157, 10, 600, "#5e6b77", "right", mono);
+
+    const boxes = [
+      { x: 60, color: "white", label: "WHITE" },
+      { x: 622, color: "black", label: "BLACK" },
+    ];
+    for (const box of boxes) {
+      const side = summary[box.color] || {};
+      const name =
+        cardPlayers[box.color] ||
+        gamePlayers[box.color]?.name ||
+        (box.color === "white" ? "White" : "Black");
+      round(box.x, 196, 518, 200, 14, "rgba(255, 255, 255, 0.025)", "rgba(255, 255, 255, 0.07)");
+      round(
+        box.x + 24,
+        220,
+        42,
+        42,
+        12,
+        box.color === "white" ? "#e8edf1" : "#141b22",
+        "rgba(255, 255, 255, 0.14)",
+      );
+      write(initials(name), box.x + 45, 247, 16, 700, box.color === "white" ? "#0a0f13" : "#e8edf1", "center");
+      write(name, box.x + 80, 240, 19, 600, "#e8edf1");
+      write(box.label, box.x + 80, 262, 11, 600, "#5e6b77", "left", mono);
+      write("ACCURACY", box.x + 24, 306, 11, 600, "#8d99a5", "left", mono);
+      write(percent(side.accuracy), box.x + 24, 358, 40, 700, "#e8edf1");
+      const elo = side.estimated_elo?.elo;
+      write(`EST. ELO ${elo ? `≈ ${elo}` : "—"}`, box.x + 24, 382, 12, 600, "#b2bcc6", "left", mono);
+      write(
+        `ACPL ${side.acpl === null || side.acpl === undefined ? "—" : number(side.acpl, 1)}`,
+        box.x + 250,
+        382,
+        12,
+        600,
+        "#b2bcc6",
+        "left",
+        mono,
+      );
+    }
+
+    const chart = { x: 60, y: 416, w: 620, h: 152 };
+    round(chart.x, chart.y, chart.w, chart.h, 14, "rgba(255, 255, 255, 0.022)", "rgba(255, 255, 255, 0.07)");
+    write("ADVANTAGE CURVE", chart.x + 22, chart.y + 26, 10, 600, "#8d99a5", "left", mono);
+    const points = report.eval_chart?.points || [];
+    const plot = { x: chart.x + 22, y: chart.y + 40, w: chart.w - 44, h: chart.h - 62 };
+    const midY = plot.y + plot.h / 2;
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.10)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(plot.x, midY);
+    ctx.lineTo(plot.x + plot.w, midY);
+    ctx.stroke();
+    if (points.length >= 2) {
+      const xAt = (index) => plot.x + (index / (points.length - 1)) * plot.w;
+      const yAt = (value) => plot.y + (1 - clamp(value) / 100) * plot.h;
+      ctx.beginPath();
+      ctx.moveTo(xAt(0), midY);
+      points.forEach((point, index) => ctx.lineTo(xAt(index), yAt(point.win_prob_white)));
+      ctx.lineTo(xAt(points.length - 1), midY);
+      ctx.closePath();
+      const area = ctx.createLinearGradient(0, plot.y, 0, plot.y + plot.h);
+      area.addColorStop(0, "rgba(95, 215, 164, 0.42)");
+      area.addColorStop(0.5, "rgba(95, 215, 164, 0.04)");
+      area.addColorStop(1, "rgba(224, 104, 104, 0.34)");
+      ctx.fillStyle = area;
+      ctx.fill();
+      ctx.beginPath();
+      points.forEach((point, index) => {
+        const x = xAt(index);
+        const y = yAt(point.win_prob_white);
+        if (index) ctx.lineTo(x, y);
+        else ctx.moveTo(x, y);
+      });
+      ctx.strokeStyle = "#e8edf1";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    } else {
+      write("No curve available", chart.x + 22, plot.y + plot.h / 2 + 4, 12, 500, "#5e6b77");
+    }
+
+    const panel = { x: 700, y: 416, w: 440, h: 152 };
+    round(panel.x, panel.y, panel.w, panel.h, 14, "rgba(255, 255, 255, 0.022)", "rgba(255, 255, 255, 0.07)");
+    write("MOVE CLASSIFICATION", panel.x + 22, panel.y + 26, 10, 600, "#8d99a5", "left", mono);
+    CLASS_ORDER.forEach((key, index) => {
+      const meta = CLASS_META[key];
+      const symbol = key === "book" ? "≡" : meta.symbol;
+      const x = panel.x + 22 + (index < 5 ? 0 : 202);
+      const y = panel.y + 52 + (index % 5) * 21;
+      write(symbol, x, y, 12, 600, classColor(key), "left", mono);
+      write(meta.label, x + 26, y, 12, 500, "#b2bcc6");
+      write(String(counts[key] || 0), x + 160, y, 12, 600, "#e8edf1", "right", mono);
+    });
+
+    write(`Result ${report.result || "*"}`, 60, 604, 11, 500, "#5e6b77", "left", mono);
+    write("Generated by Chess Master · Stockfish Game Review", 1140, 604, 11, 500, "#5e6b77", "right", mono);
+    return canvas;
   }
 
   /* --------------------------------------------------------------------

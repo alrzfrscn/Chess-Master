@@ -60,7 +60,11 @@ def test_api_info(api: ChessMasterApi) -> None:
         "start_game_review",
         "cancel_game_review",
         "get_game_review",
+        "get_drills",
+        "start_drill",
     }.issubset(set(data["methods"]))
+    assert data["capabilities"]["board_editor"] is True
+    assert data["capabilities"]["drills"] is True
     assert data["elo"]["min"] == 400
     assert data["elo"]["max"] == 3000
     assert len(data["elo"]["presets"]) == 7
@@ -180,3 +184,59 @@ def test_api_session_is_independent_of_direct_sessions() -> None:
     api_state = assert_ok(api.get_game_state())
     assert api_state["total_plies"] == 0
     assert direct.to_state()["total_plies"] == 1
+
+
+def test_opening_explorer_follows_the_viewed_ply() -> None:
+    api = ChessMasterApi(db_path=":memory:")
+
+    data = assert_ok(api.get_opening_explorer())
+    assert data["in_book"] is True
+    assert data["current"]["name"] == "Starting position"
+    assert {"e2e4", "d2d4"}.issubset({item["uci"] for item in data["continuations"]})
+
+    assert_ok(api.make_move("e4"))
+    data = assert_ok(api.get_opening_explorer())
+    assert data["in_book"] is True
+    assert data["current"]["eco"] == "B00"
+    assert data["current"]["last_book_ply"] == 1
+    assert data["continuations"]
+
+    assert_ok(api.navigate_ply(0))
+    data = assert_ok(api.get_opening_explorer())
+    assert data["current"]["name"] == "Starting position"
+
+
+def test_search_openings_api_finds_and_validates() -> None:
+    api = ChessMasterApi(db_path=":memory:")
+
+    data = assert_ok(api.search_openings("najdorf"))
+    assert data["count"] == len(data["openings"]) > 0
+    assert all("najdorf" in item["full_name"].lower() for item in data["openings"])
+
+    data = assert_ok(api.search_openings("", "B90", 3))
+    assert data["count"] == 3
+    assert all(item["eco"] == "B90" for item in data["openings"])
+
+    assert_error(api.search_openings(42), "invalid_input")  # type: ignore[arg-type]
+
+
+def test_archive_round_trips_the_bot_pace() -> None:
+    api = ChessMasterApi(db_path=":memory:")
+    state = assert_ok(
+        api.new_game(
+            "stockfish",
+            {"player_color": "white", "bot_elo": 1200, "bot_pace": "rapid"},
+        )
+    )
+    assert state["engine"]["bot_pace"] == "rapid"
+    game_id = state["game_id"]
+
+    assert_ok(api.make_move("e4"))
+    saved = assert_ok(api.save_current_game())
+    assert saved["saved"] is True
+    assert saved["game"]["bot_pace"] == "rapid"
+
+    assert_ok(api.new_game("pass_play"))
+    restored = assert_ok(api.load_archived_game(game_id))
+    assert restored["engine"]["bot_pace"] == "rapid"
+    assert restored["mode"] == "stockfish"

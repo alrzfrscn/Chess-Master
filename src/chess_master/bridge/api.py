@@ -23,11 +23,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from chess_master import __version__
+from chess_master.analysis.openings import get_default_book
 from chess_master.analysis.review import CONFIRM_DEPTH_CAP, REVIEW_PRESETS
 from chess_master.analysis.winprob import model_info
 from chess_master.engine.clock import TIME_CONTROL_PRESETS
 from chess_master.engine.coordinator import EngineCoordinator
-from chess_master.engine.errors import ChessMasterError, InvalidInputError
+from chess_master.engine.errors import ChessMasterError, InvalidInputError, InvalidModeError
 from chess_master.engine.game import (
     DEFAULT_BOT_ELO,
     MAX_BOT_ELO,
@@ -41,6 +42,7 @@ from chess_master.engine.stockfish import (
     ELO_PRESETS,
     StockfishManager,
 )
+from chess_master.models.drills import drills_payload, get_drill
 from chess_master.models.samples import samples_payload
 from chess_master.storage.db import GameStore
 
@@ -261,6 +263,43 @@ class ChessMasterApi:
 
         return self._execute(operation)
 
+    def start_drill(
+        self, drill_id: str, options: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Start a curated drill from its FEN, player color and recommended Elo."""
+
+        def operation() -> dict[str, Any]:
+            if not isinstance(drill_id, str) or not drill_id.strip():
+                raise InvalidInputError("Choose a drill to practise.")
+            drill = get_drill(drill_id.strip())
+            if drill is None:
+                raise InvalidInputError(
+                    "That drill was not found.",
+                    details={"drill_id": drill_id},
+                )
+            if options is not None and not isinstance(options, Mapping):
+                raise InvalidInputError("Drill options must be an object.")
+            incoming = dict(options or {})
+            mode = incoming.pop("mode", "stockfish")
+            if mode not in VALID_MODES:
+                raise InvalidModeError(
+                    "Choose a supported game mode.",
+                    details={"mode": mode, "valid_modes": list(VALID_MODES)},
+                )
+            incoming.setdefault("player_color", drill["player_color"])
+            if mode == "stockfish":
+                incoming.setdefault("bot_elo", drill["recommended_elo"])
+            incoming.setdefault("event_name", f"Drill - {drill['title']}")
+            incoming["start_fen"] = drill["fen"]
+            session = GameSession.new_game(mode, incoming)
+            self._archive_before_replacing()
+            self._bind_session(session)
+            state = self._compose_state()
+            state["drill"] = drill
+            return state
+
+        return self._execute(operation)
+
     def make_move(self, move: str) -> dict[str, Any]:
         """Play a move in UCI (``e2e4``) or SAN (``Nf3``) notation."""
 
@@ -403,7 +442,7 @@ class ChessMasterApi:
         return self._execute(operation)
 
     def get_engine_status(self) -> dict[str, Any]:
-        """Diagnostics for the engine strip and QA automation."""
+        """Diagnostics for the sidebar/Engine setup and QA automation."""
 
         def operation() -> dict[str, Any]:
             state = self._compose_state()
@@ -666,6 +705,8 @@ class ChessMasterApi:
                     "export_pgn",
                     "get_api_info",
                     "get_samples",
+                    "get_drills",
+                    "start_drill",
                     "engine_poll",
                     "set_analysis_options",
                     "configure_engine_path",
@@ -679,6 +720,8 @@ class ChessMasterApi:
                     "delete_archived_game",
                     "clear_game_archive",
                     "export_archive_pgn",
+                    "get_opening_explorer",
+                    "search_openings",
                 ],
                 "capabilities": {
                     "pass_and_play": True,
@@ -699,6 +742,11 @@ class ChessMasterApi:
                     "archive": True,
                     "retry_mistake": True,
                     "history_dashboard": True,
+                    "opening_explorer": True,
+                    "board_themes": True,
+                    "review_export": True,
+                    "board_editor": True,
+                    "drills": True,
                 },
                 "archive": {"db_info": self._store.db_info()},
                 "analysis": model_info(),
@@ -718,6 +766,51 @@ class ChessMasterApi:
         """Famous games/positions for the import drawer."""
 
         return self._execute(lambda: {"samples": samples_payload()})
+
+    def get_drills(self) -> dict[str, Any]:
+        """Curated endgame/tactical practice positions."""
+
+        def operation() -> dict[str, Any]:
+            drills = drills_payload()
+            return {"drills": drills, "count": len(drills)}
+
+        return self._execute(operation)
+
+    # -- opening explorer -------------------------------------------------
+    def get_opening_explorer(self) -> dict[str, Any]:
+        """Book continuations for the position the table is viewing."""
+
+        def operation() -> dict[str, Any]:
+            session = self._session
+            moves = session.move_ucis(session.view_ply)
+            return get_default_book().explore(moves, session.board.fen())
+
+        return self._execute(operation)
+
+    def search_openings(
+        self, query: str = "", eco_prefix: str = "", limit: int = 40
+    ) -> dict[str, Any]:
+        """Search the bundled ECO dictionary by name fragment or ECO code."""
+
+        def operation() -> dict[str, Any]:
+            if query is not None and not isinstance(query, str):
+                raise InvalidInputError("Opening search text must be text.")
+            if eco_prefix is not None and not isinstance(eco_prefix, str):
+                raise InvalidInputError("ECO code must be text.")
+            if isinstance(limit, bool):
+                raise InvalidInputError("Opening search limit must be a whole number.")
+            try:
+                clean_limit = int(limit)
+            except (TypeError, ValueError) as exc:
+                raise InvalidInputError("Opening search limit must be a whole number.") from exc
+            results = get_default_book().search_openings(
+                query=query or "",
+                eco_prefix=eco_prefix or "",
+                limit=max(1, min(clean_limit, 200)),
+            )
+            return {"openings": results, "count": len(results)}
+
+        return self._execute(operation)
 
     def _shutdown(self) -> None:
         """Stop the engine worker.  Private so it is not exposed over HTTP."""

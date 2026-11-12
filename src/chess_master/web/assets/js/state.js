@@ -25,6 +25,7 @@ export const app = {
   newColor: "white",
   newElo: 1400,
   newTimeControl: "unlimited",
+  newPace: "blitz",
   clockAnchor: null,
   clockTimer: null,
   clockZeroKey: "",
