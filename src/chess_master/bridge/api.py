@@ -72,6 +72,7 @@ class ChessMasterApi:
         db_path: str | Path | None = None,
         store: GameStore | None = None,
         client_id: str = "local",
+        session_id: str | None = None,
         rooms: RoomManager | None = None,
     ) -> None:
         self._lock = threading.RLock()
@@ -84,6 +85,7 @@ class ChessMasterApi:
         self._owns_store = store is None
         self._store = store if store is not None else GameStore(db_path)
         self._client_id = str(client_id or "local")
+        self._session_id = str(session_id) if session_id else None
         self._rooms = rooms if rooms is not None else RoomManager()
         self._room_id: str | None = None
         self._saved_reviews: set[str] = set()
@@ -100,6 +102,10 @@ class ChessMasterApi:
     @property
     def client_id(self) -> str:
         return self._client_id
+
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
 
     def _bind_client(self, client_id: str) -> None:
         """Adopt the caller's browser identity when a pooled session is reused."""
@@ -150,7 +156,7 @@ class ChessMasterApi:
 
     def _seat(self, room: Room | None = None) -> str | None:
         room = room if room is not None else self._room()
-        return room.seat_for(self._client_id) if room is not None else None
+        return room.seat_for(self._client_id, self._session_id) if room is not None else None
 
     def _fair_play(self) -> bool:
         room = self._room()
@@ -193,9 +199,12 @@ class ChessMasterApi:
             state["evaluation"]["arrows"] = False
         state["review"] = self._engine.game_review()
         room = self._room()
-        state["room"] = room.to_state(self._client_id) if room is not None else None
-        if room is not None and room.seat_for(self._client_id):
-            state["orientation"] = room.seat_for(self._client_id)
+        state["room"] = (
+            room.to_state(self._client_id, self._session_id) if room is not None else None
+        )
+        seat = room.seat_for(self._client_id, self._session_id) if room is not None else None
+        if seat:
+            state["orientation"] = seat
         return state
 
     def _bind_session(self, session: GameSession) -> None:
@@ -380,7 +389,9 @@ class ChessMasterApi:
 
         def operation() -> dict[str, Any]:
             self._archive_before_replacing()
-            room = self._rooms.create_room(self._client_id, options)
+            room = self._rooms.create_room(
+                self._client_id, options, session_id=self._session_id
+            )
             self._room_id = room.room_id
             with self._rooms.lock:
                 self._bind_session(room.session)
@@ -392,7 +403,9 @@ class ChessMasterApi:
         """Join a room by code: the second client takes black, others spectate."""
 
         def operation() -> dict[str, Any]:
-            room = self._rooms.join_room(room_id, self._client_id)
+            room = self._rooms.join_room(
+                room_id, self._client_id, session_id=self._session_id
+            )
             if room.room_id != self._room_id:
                 self._archive_before_replacing()
             self._room_id = room.room_id
@@ -408,7 +421,7 @@ class ChessMasterApi:
         def operation() -> dict[str, Any]:
             room = self._require_room()
             self._archive_current(force=True)
-            self._rooms.rematch(room, self._client_id)
+            self._rooms.rematch(room, self._client_id, self._session_id)
             self._bind_session(room.session)
             return self._compose_state()
 

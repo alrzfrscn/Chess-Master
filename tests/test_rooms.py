@@ -221,6 +221,50 @@ def test_web_sessions_share_one_room_registry() -> None:
         sessions.close()
 
 
+def test_same_browser_two_tabs_take_opposite_seats() -> None:
+    """Two tabs share localStorage's client_id but have different session_ids."""
+
+    from chess_master.bridge.sessions import SessionManager
+
+    sessions = SessionManager(ChessMasterApi())
+    try:
+        tab_one = sessions.api_for("session_1", "shared-client")
+        tab_two = sessions.api_for("session_2", "shared-client")
+        code = assert_ok(tab_one.create_room())["room"]["room_id"]
+
+        joined = assert_ok(tab_two.join_room(code))
+        assert joined["room"]["seat"] == "black"
+        assert joined["room"]["status"] == "active"
+        assert joined["room"]["spectator"] is False
+        assert assert_ok(tab_one.get_game_state())["room"]["seat"] == "white"
+
+        # Each tab keeps its own seat on reconnect.
+        assert assert_ok(sessions.api_for("session_1", "shared-client").get_game_state())[
+            "room"
+        ]["seat"] == "white"
+        assert assert_ok(sessions.api_for("session_2", "shared-client").get_game_state())[
+            "room"
+        ]["seat"] == "black"
+    finally:
+        sessions.close()
+
+
+def test_client_id_reconnect_across_tabs() -> None:
+    """A stable client_id still reclaims its seat from a new tab."""
+
+    rooms = RoomManager()
+    host = make_api("alice", rooms)
+    guest = make_api("bob", rooms)
+    code = assert_ok(host.create_room())["room"]["room_id"]
+    assert_ok(guest.join_room(code))
+
+    # Same client, new session (browser restart): the client keeps its seat.
+    returning = ChessMasterApi(client_id="bob", session_id="fresh-session", rooms=rooms)
+    state = assert_ok(returning.join_room(code))
+    assert state["room"]["seat"] == "black"
+    assert state["room"]["status"] == "active"
+
+
 def test_stockfish_jobs_are_isolated_per_coordinator(tmp_path, monkeypatch) -> None:
     binary = tmp_path / "stockfish.exe"
     binary.write_bytes(b"")

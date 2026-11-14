@@ -1,0 +1,24 @@
+services:
+  chess-master:
+    build: .
+    image: chess-master:1.0.0
+    ports:
+      - "8000:8000"
+    environment:
+      CHESS_MASTER_HOST: 0.0.0.0
+      PORT: "8000"
+    volumes:
+      - ./state:/app/state
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

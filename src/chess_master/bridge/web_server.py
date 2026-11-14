@@ -61,7 +61,7 @@ class _ThreadingHTTPServer(ThreadingHTTPServer):
 
 
 class WebAppServer:
-    """A loopback-only HTTP server for the packaged web UI."""
+    """An HTTP server for the packaged web UI (loopback or LAN when configured)."""
 
     def __init__(
         self,

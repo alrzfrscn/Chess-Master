@@ -103,6 +103,75 @@ Open <http://127.0.0.1:8765/>. The HTTP API is deliberately disabled unless
 `--serve` or `--http-api` is used; the desktop window talks to Python through the
 PyWebView bridge instead.
 
+### Windows desktop app (standalone executable)
+
+Build the self-contained folder and portable archive:
+
+```powershell
+python -m pip install -e ".[dev,build]"      # PyInstaller + Pillow
+.\.venv\Scripts\python.exe scripts\build_exe.py
+```
+
+The script rebuilds the frontend assets (`npm run build`), generates
+`assets/icon.ico`, and runs PyInstaller. The result is:
+
+- `dist\ChessMaster\ChessMaster.exe` — the windowed application.
+- `dist\ChessMaster\bin\stockfish\` — the bundled engine, copied from `bin/`.
+- `dist\ChessMaster\state\chess_master.db` — the writable archive.
+- `dist\ChessMaster-v1.0.0-win64-portable.zip` — the same folder, ready to copy.
+
+Run it, or create a Desktop shortcut:
+
+```powershell
+.\dist\ChessMaster\ChessMaster.exe
+powershell -ExecutionPolicy Bypass -File scripts\create_shortcut.ps1
+```
+
+The build needs the Microsoft Edge WebView2 runtime, which ships with Windows
+10/11. Bundled assets are read from inside the executable's `_internal` folder;
+the engine and the database live next to the `.exe`, so the folder stays
+portable. If that folder is read-only the database falls back to
+`%LOCALAPPDATA%\ChessMaster\state`.
+
+CI check:
+
+```powershell
+.\dist\ChessMaster\ChessMaster.exe --smoke-test
+```
+
+### Multi-user web server
+
+Run the web build locally (LAN playable):
+
+```powershell
+.\scripts\run_web.ps1
+```
+
+The script prints `http://127.0.0.1:8000` and the LAN address
+(`http://192.168.x.x:8000`). Without the script:
+
+```powershell
+$env:PYTHONPATH = "src"
+.\.venv\Scripts\python.exe -m chess_master --serve --host 0.0.0.0 --port 8000
+```
+
+`--host` defaults to `127.0.0.1`; any bind address works and
+`CHESS_MASTER_HOST` / `CHESS_MASTER_PORT` (or `PORT`) are read when the flags are
+omitted. Each browser tab gets an isolated session and shares one SQLite archive
+and one Stockfish process; rooms, invites, spectators and reconnect by browser
+`client_id` work as in the desktop app.
+
+Docker deployment:
+
+```powershell
+docker compose up --build
+```
+
+The image builds the frontend in a `node:20-alpine` stage and runs the Python
+server on `python:3.12-slim` with the Debian `stockfish` package. Port `8000` is
+published and `./state` is mounted at `/app/state` for SQLite persistence. The
+healthcheck polls `http://127.0.0.1:8000/api/health`.
+
 ### Build and test
 
 ```powershell
@@ -147,14 +216,14 @@ move.
 ```text
 Chess Master/
 |-- src/chess_master/
-|   |-- app.py                 PyWebView window, dev server, smoke test, --engine
-|   |-- paths.py               Project, bin, assets and web roots
+|   |-- app.py                 PyWebView window, web server, smoke test, --host/--engine
+|   |-- paths.py               Source + PyInstaller frozen roots
 |   |-- analysis/
 |   |   |-- review.py          Two-pass Game Review pipeline + report contract
 |   |   `-- winprob.py         Lichess logistic model, accuracy, ACPL, Elo
 |   |-- bridge/
 |   |   |-- api.py             JS API envelope, session lock, engine polling
-|   |   `-- web_server.py      Loopback static server + optional dev JSON API
+|   |   `-- web_server.py      Static server + optional JSON API (loopback or LAN)
 |   |-- engine/
 |   |   |-- stockfish.py       Discovery, Elo profiles, cache, worker, selection
 |   |   |-- coordinator.py     Session binding, scheduling, stale-token policy
@@ -178,10 +247,16 @@ Chess Master/
 |           |-- pieces/        Bundled SVG piece set
 |           `-- vendor/        Chessground 9.2.1 and chess.js 1.4.0
 |-- bin/stockfish/             Local Stockfish binary (not a build artifact)
-|-- tests/                     180 pytest checks across 14 modules
-|-- scripts/sync_vendor.mjs    Reproducible vendor asset sync
+|-- tests/                     281 pytest checks across analysis, engine, bridge and packaging
+|-- scripts/
+|   |-- sync_vendor.mjs        Reproducible vendor asset sync
+|   |-- build_exe.py           PyInstaller build, icon, Stockfish copy and portable zip
+|   |-- create_shortcut.ps1    Desktop shortcut for dist\ChessMaster\ChessMaster.exe
+|   `-- run_web.ps1            One-click LAN web server on port 8000
 |-- docs/                      Phase 1–4 UI captures and engineering reports
 |-- package.json               Tailwind CLI + vendor build tooling
+|-- Dockerfile                 Two-stage web image (Node assets + Python runtime)
+|-- docker-compose.yml         Port 8000 + persistent ./state volume
 |-- pyproject.toml             Python package and pytest configuration
 |-- THIRD_PARTY_NOTICES.md
 `-- README.md

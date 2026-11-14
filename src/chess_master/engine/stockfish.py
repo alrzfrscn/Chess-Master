@@ -20,6 +20,7 @@ import math
 import os
 import random
 import shutil
+import subprocess
 import threading
 import time
 from collections import OrderedDict
@@ -1340,7 +1341,12 @@ class StockfishManager:
 
     @staticmethod
     def _default_engine_factory(path: str) -> Any:
-        return chess.engine.SimpleEngine.popen_uci(path, timeout=10.0)
+        popen_kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            # The windowed executable has no console; without this flag every
+            # spawned Stockfish flashes a black window.
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        return chess.engine.SimpleEngine.popen_uci(path, timeout=10.0, **popen_kwargs)
 
     @staticmethod
     def _close_engine(engine: Any, timeout: float = 2.0) -> None:

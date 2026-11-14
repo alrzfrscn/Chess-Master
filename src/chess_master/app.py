@@ -44,11 +44,16 @@ def _set_windows_app_id() -> None:
         logger.debug("Could not set the Windows app id", exc_info=True)
 
 
-def run_server(port: int = 8765, *, engine_path: str | None = None) -> int:
+def run_server(
+    port: int = 8765,
+    *,
+    host: str = "127.0.0.1",
+    engine_path: str | None = None,
+) -> int:
     """Run the UI + development HTTP API headlessly (used by verification)."""
 
     api = ChessMasterApi(engine_path=engine_path)
-    server = WebAppServer(WEB_ROOT, api, port=port, expose_api=True)
+    server = WebAppServer(WEB_ROOT, api, host=host, port=port, expose_api=True)
     try:
         server.start()
         print(f"Chess Master dev server: {server.url}", flush=True)
@@ -146,7 +151,13 @@ def main(argv: list[str] | None = None) -> int:
         "--port",
         type=int,
         default=None,
-        help="Port for --serve (default 8765) or the desktop asset server (default: random).",
+        help="Port for --serve (default 8765 or $PORT) or the desktop asset server (default: random).",
+    )
+    parser.add_argument(
+        "--host",
+        default=None,
+        metavar="ADDRESS",
+        help="Bind address for --serve (default 127.0.0.1 or $CHESS_MASTER_HOST; use 0.0.0.0 for LAN).",
     )
     parser.add_argument(
         "--smoke-test",
@@ -167,7 +178,14 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.serve:
-        return run_server(args.port or 8765, engine_path=args.engine)
+        host = args.host or os.environ.get("CHESS_MASTER_HOST") or "127.0.0.1"
+        port = args.port
+        if port is None:
+            try:
+                port = int(os.environ.get("CHESS_MASTER_PORT") or os.environ.get("PORT") or 8765)
+            except ValueError:
+                port = 8765
+        return run_server(port, host=host, engine_path=args.engine)
     return run_app(
         debug=args.debug,
         http_api=args.http_api,

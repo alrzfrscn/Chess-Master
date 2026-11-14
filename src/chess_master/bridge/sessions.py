@@ -114,7 +114,7 @@ class SessionManager:
             self._evict(now)
             entry = self._entries.get(key)
             if entry is None:
-                entry = _Entry(self._create_api(client or "local"), now)
+                entry = _Entry(self._create_api(client or "local", key), now)
                 self._entries[key] = entry
                 self._evict(now)
             elif client is not None:
@@ -137,7 +137,7 @@ class SessionManager:
             self._worker.stop()
 
     # -- internals -------------------------------------------------------
-    def _create_api(self, client_id: str) -> ChessMasterApi:
+    def _create_api(self, client_id: str, session_id: str | None = None) -> ChessMasterApi:
         if self._worker is None:
             self._worker = StockfishManager(path=self._engine_path)
         return ChessMasterApi(
@@ -145,6 +145,7 @@ class SessionManager:
             worker=self._worker,
             store=self._store,
             client_id=client_id,
+            session_id=session_id,
             rooms=self._rooms,
         )
 

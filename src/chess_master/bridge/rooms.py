@@ -26,13 +26,27 @@ _CODE_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"
 
 
 class Room:
-    """One shared table with up to two seated clients."""
+    """One shared table with up to two seated clients.
 
-    def __init__(self, room_id: str, session: GameSession, host: str, now: float) -> None:
+    Each seat remembers both the browser's stable ``client_id`` (reconnects
+    across tabs/devices) and the tab's ``session_id`` (so two tabs of one
+    browser are two different players).
+    """
+
+    def __init__(
+        self,
+        room_id: str,
+        session: GameSession,
+        host: str,
+        now: float,
+        host_session: str | None = None,
+    ) -> None:
         self.room_id = room_id
         self.session = session
         self.white_client = host
+        self.white_session = host_session
         self.black_client: str | None = None
+        self.black_session: str | None = None
         self.created_at = now
         self.updated_at = now
 
@@ -42,16 +56,29 @@ class Room:
             return "finished"
         return "active" if self.black_client else "waiting"
 
-    def seat_for(self, client_id: str | None) -> str | None:
+    def seat_for(self, client_id: str | None, session_id: str | None = None) -> str | None:
         client = str(client_id or "")
+        tab = str(session_id or "")
+        # A tab that already sat down reconnects to its own seat first.
+        if tab:
+            if tab == self.white_session:
+                return "white"
+            if self.black_session and tab == self.black_session:
+                return "black"
         if client == self.white_client:
-            return "white"
-        if client is not None and self.black_client and client == self.black_client:
-            return "black"
+            # A second tab of the same browser has the same client but a new
+            # tab id: while Black is open it must take that seat, not White.
+            if not tab or self.white_session in (None, tab) or self.black_client:
+                return "white"
+        if self.black_client and client == self.black_client:
+            if not tab or self.black_session in (None, tab):
+                return "black"
         return None
 
-    def to_state(self, client_id: str | None = None) -> dict[str, Any]:
-        seat = self.seat_for(client_id)
+    def to_state(
+        self, client_id: str | None = None, session_id: str | None = None
+    ) -> dict[str, Any]:
+        seat = self.seat_for(client_id, session_id)
         status = self.status
         return {
             "room_id": self.room_id,
@@ -82,7 +109,11 @@ class RoomManager:
         self._rooms: dict[str, Room] = {}
 
     def create_room(
-        self, client_id: str, options: Mapping[str, Any] | None = None
+        self,
+        client_id: str,
+        options: Mapping[str, Any] | None = None,
+        *,
+        session_id: str | None = None,
     ) -> Room:
         if options is not None and not isinstance(options, Mapping):
             raise InvalidInputError("Room options must be an object.")
@@ -93,11 +124,19 @@ class RoomManager:
             if session.clock is not None:
                 # The clock runs only once both players are seated.
                 session.clock.stop()
-            room = Room(self._new_code(), session, str(client_id), now)
+            room = Room(
+                self._new_code(),
+                session,
+                str(client_id),
+                now,
+                host_session=str(session_id) if session_id else None,
+            )
             self._rooms[room.room_id] = room
             return room
 
-    def join_room(self, room_id: Any, client_id: str) -> Room:
+    def join_room(
+        self, room_id: Any, client_id: str, *, session_id: str | None = None
+    ) -> Room:
         if not isinstance(room_id, str) or not room_id.strip():
             raise InvalidInputError("Enter a room code to join.")
         code = room_id.strip().lower()
@@ -111,8 +150,10 @@ class RoomManager:
                     details={"room_id": code},
                 )
             client = str(client_id)
-            if room.seat_for(client) is None and room.black_client is None:
+            tab = str(session_id) if session_id else None
+            if room.seat_for(client, tab) is None and room.black_client is None:
                 room.black_client = client
+                room.black_session = tab
                 if room.session.clock is not None:
                     room.session.clock.start()
             # A returning seated client keeps its seat; anyone else spectates.
@@ -129,9 +170,11 @@ class RoomManager:
         with self.lock:
             room.updated_at = self._clock()
 
-    def rematch(self, room: Room, client_id: str | None) -> Room:
+    def rematch(
+        self, room: Room, client_id: str | None, session_id: str | None = None
+    ) -> Room:
         with self.lock:
-            if room.seat_for(client_id) is None:
+            if room.seat_for(client_id, session_id) is None:
                 raise InvalidInputError("Only the players can start a rematch.")
             if room.status != "finished":
                 raise InvalidInputError("Finish the game before a rematch.")
@@ -139,6 +182,10 @@ class RoomManager:
                 raise InvalidInputError("Wait for an opponent before a rematch.")
             # Colors swap for the next game: the seats move with the players.
             room.white_client, room.black_client = room.black_client, room.white_client
+            room.white_session, room.black_session = (
+                room.black_session,
+                room.white_session,
+            )
             room.session.rematch_swap()
             room.updated_at = self._clock()
             return room
