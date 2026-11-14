@@ -69,6 +69,8 @@ class ChessMasterApi:
         engine_path: str | None = None,
         worker: StockfishManager | None = None,
         db_path: str | Path | None = None,
+        store: GameStore | None = None,
+        client_id: str = "local",
     ) -> None:
         self._lock = threading.RLock()
         self._session = GameSession.new_game("pass_play")
@@ -76,9 +78,29 @@ class ChessMasterApi:
         self._polling_started = False
         self._engine = EngineCoordinator(path=engine_path, worker=worker)
         self._engine.bind(self._session)
-        self._store = GameStore(db_path)
+        # A pooled web session shares the process-wide archive with every other session.
+        self._owns_store = store is None
+        self._store = store if store is not None else GameStore(db_path)
+        self._client_id = str(client_id or "local")
         self._saved_reviews: set[str] = set()
         self._saved_terminals: set[tuple[str, int, str]] = set()
+
+    @property
+    def store(self) -> GameStore:
+        return self._store
+
+    @property
+    def worker(self) -> StockfishManager:
+        return self._engine.worker
+
+    @property
+    def client_id(self) -> str:
+        return self._client_id
+
+    def _bind_client(self, client_id: str) -> None:
+        """Adopt the caller's browser identity when a pooled session is reused."""
+
+        self._client_id = str(client_id or "local")
 
     # -- envelope helpers ------------------------------------------------
     @staticmethod
@@ -147,7 +169,9 @@ class ChessMasterApi:
         session = self._session
         if not force and session.total_plies < 2:
             return None
-        return self._store.upsert_game(session.to_archive())
+        return self._store.upsert_game(
+            {**session.to_archive(), "client_id": self._client_id}
+        )
 
     def _archive_before_replacing(self) -> None:
         if self._session.total_plies >= 2 or self._session.is_over:
@@ -576,12 +600,13 @@ class ChessMasterApi:
                 offset=clean_offset,
                 mode=mode or None,
                 query=query or None,
+                client_id=self._client_id,
             )
             return {
                 "games": games,
                 "total": total,
-                "stats": self._store.stats(),
-                "trend": self._store.history_trend(),
+                "stats": self._store.stats(client_id=self._client_id),
+                "trend": self._store.history_trend(client_id=self._client_id),
                 "db_info": self._store.db_info(),
             }
 
@@ -636,7 +661,7 @@ class ChessMasterApi:
         """Delete every archived game and review, then vacuum the database."""
 
         def operation() -> dict[str, Any]:
-            deleted = self._store.clear()
+            deleted = self._store.clear(client_id=self._client_id)
             self._saved_reviews.clear()
             self._saved_terminals.clear()
             # Keep the live session from being re-archived by the next engine poll.
@@ -656,7 +681,7 @@ class ChessMasterApi:
                 )
             return {
                 "deleted": deleted,
-                "stats": self._store.stats(),
+                "stats": self._store.stats(client_id=self._client_id),
                 "db_info": self._store.db_info(),
             }
 
@@ -671,7 +696,9 @@ class ChessMasterApi:
                     raise InvalidInputError("Archive export expects a list of game ids.")
                 rows = [self._store.get_game(str(game_id)) for game_id in game_ids]
             else:
-                rows, _ = self._store.list_games(limit=500, offset=0)
+                rows, _ = self._store.list_games(
+                    limit=500, offset=0, client_id=self._client_id
+                )
             blocks = [str(row["pgn"]).strip() for row in rows if row and row.get("pgn")]
             stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
             return {
@@ -816,4 +843,10 @@ class ChessMasterApi:
         """Stop the engine worker.  Private so it is not exposed over HTTP."""
 
         self._engine.shutdown()
-        self._store.close()
+        if self._owns_store:
+            self._store.close()
+
+    def _detach(self) -> None:
+        """Release a pooled web session; the shared worker and archive stay alive."""
+
+        self._engine.detach()

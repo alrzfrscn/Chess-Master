@@ -2,10 +2,10 @@
  * and the classification matrix. All chess facts arrive in the report payload,
  * so this module never needs an engine call to step through a line. */
 
-import { call, errorMessage } from "./api.js";
+import { bridgeMode, call, errorMessage, shareGameUrl } from "./api.js";
 import { Chess } from "../vendor/chess.js/chess.js";
 import { sound } from "./sound.js";
-import { toast } from "./ui.js";
+import { copyText, toast } from "./ui.js";
 
 const PRESET_DEPTH = { fast: 10, standard: 14, deep: 16 };
 
@@ -198,6 +198,7 @@ export class ReviewPanel {
       cancel: document.getElementById("btn-cancel-review"),
       reviewAgain: document.getElementById("btn-review-again"),
       exportCard: document.getElementById("btn-export-card"),
+      share: document.getElementById("btn-share-link"),
       progress: document.getElementById("review-progress"),
       progressPhase: document.getElementById("review-progress-phase"),
       progressCount: document.getElementById("review-progress-count"),
@@ -268,6 +269,7 @@ export class ReviewPanel {
     this.refs.cancel?.addEventListener("click", () => this.cancel());
     this.refs.reviewAgain?.addEventListener("click", () => this.start());
     this.refs.exportCard?.addEventListener("click", () => this.exportCard());
+    this.refs.share?.addEventListener("click", () => this.shareGame());
     this.refs.moveList?.addEventListener("click", (event) => {
       const row = event.target.closest("[data-review-ply]");
       if (!row) return;
@@ -1317,6 +1319,36 @@ export class ReviewPanel {
   /* --------------------------------------------------------------------
      Shareable review card
      -------------------------------------------------------------------- */
+
+  /** Browser: the archive URL. Desktop: no URL exists, so copy the PGN. */
+  async shareGame() {
+    const gameId = this.game?.game_id;
+    if (!gameId) return;
+    if (bridgeMode() === "native") {
+      try {
+        const payload = await call("export_pgn");
+        const text = (payload && payload.pgn) || this.game?.fen || "";
+        const copied = await copyText(text);
+        toast({
+          title: copied ? "PGN copied" : "Copy unavailable",
+          description: copied
+            ? "Desktop mode has no share URLs; the game is on your clipboard."
+            : "Export the PGN from the Import tab instead.",
+          kind: copied ? "success" : "warning",
+        });
+      } catch (error) {
+        toast({ title: "Could not copy the game", description: errorMessage(error), kind: "error" });
+      }
+      return;
+    }
+    const url = shareGameUrl(gameId);
+    const copied = await copyText(url);
+    toast({
+      title: copied ? "Share link copied" : "Copy unavailable",
+      description: copied ? url : "Select the address bar and add the game id manually.",
+      kind: copied ? "success" : "warning",
+    });
+  }
 
   async exportCard() {
     if (!this.report) return;

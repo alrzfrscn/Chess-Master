@@ -1,6 +1,6 @@
 /** Local archive dashboard: KPI strip, performance trend, filters and actions. */
 
-import { call, errorMessage } from "./api.js";
+import { bridgeMode, call, errorMessage, shareGameUrl } from "./api.js";
 import { askConfirm, copyText, downloadText, toast } from "./ui.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -402,6 +402,7 @@ export class HistoryPanel {
       ["review", "Review", "btn-quiet"],
       ["pgn", "Export PGN", "btn-quiet"],
       ["fen", "Copy FEN", "btn-quiet"],
+      ...(bridgeMode() === "native" ? [] : [["share", "Copy link", "btn-quiet"]]),
       ["delete", "Delete", "btn-danger"],
     ]) {
       const button = node("button", `btn ${variant} btn-compact`, label);
@@ -431,6 +432,16 @@ export class HistoryPanel {
       this.notify({
         title: copied ? "FEN copied" : "Copy unavailable",
         description: copied ? row.final_fen : "The archived position could not be copied.",
+        kind: copied ? "success" : "warning",
+      });
+      return;
+    }
+    if (action === "share") {
+      const url = shareGameUrl(row.game_id);
+      const copied = await copyText(url);
+      this.notify({
+        title: copied ? "Share link copied" : "Copy unavailable",
+        description: copied ? url : "Select the address bar and add the game id manually.",
         kind: copied ? "success" : "warning",
       });
       return;

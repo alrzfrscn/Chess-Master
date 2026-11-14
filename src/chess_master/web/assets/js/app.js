@@ -1,6 +1,6 @@
 /** Application entry point: bridge boot, state rendering, input routing. */
 
-import { call, connect, detailLines, errorMessage } from "./api.js";
+import { call, connect, detailLines, errorMessage, requestedGameId, subscribeEvents } from "./api.js";
 import { BoardController } from "./board.js";
 import { EditorPanel } from "./editorPanel.js";
 import { OpeningExplorer } from "./explorer.js";
@@ -478,6 +478,33 @@ async function studyOpeningLine(pgn, label = "") {
     successDescription: label ? `${label} is loaded for study.` : "The book line is loaded for study.",
   });
   if (state) tabs.setActive("moves");
+}
+
+/** Load a shared archive link (`/?game=<game_id>`). */
+async function openSharedGame(gameId) {
+  try {
+    const state = await call("load_archived_game", gameId);
+    applyState(state, { autoOrient: true });
+    tabs.setActive(state.restored_review ? "review" : "moves");
+    historyPanel?.refreshCount();
+    if (state.restored_review) {
+      toast({
+        title: "Shared review opened",
+        description: "The stored Game Review is ready to read.",
+        kind: "success",
+        duration: 6000,
+      });
+    }
+    return state;
+  } catch (error) {
+    toast({
+      title: "Shared game unavailable",
+      description: composeError(error),
+      kind: "warning",
+      duration: 7000,
+    });
+    return null;
+  }
 }
 
 async function launchEditorPosition({ mode, fen, playerColor }) {
@@ -965,6 +992,12 @@ function startEnginePolling() {
   pollEngine();
 }
 
+/** Push stream in browser mode: poll at once when the server says state moved. */
+function startEventStream() {
+  if (app.eventStreamOff) return;
+  app.eventStreamOff = subscribeEvents(() => pollSoon(20));
+}
+
 /** 100 ms local interpolation; when the active clock reaches zero, poll at once. */
 function startClockTicker() {
   if (app.clockTimer) return;
@@ -1450,10 +1483,13 @@ async function bootstrap() {
     if (panel) panel.setSamples(app.samples);
     editorPanel?.setDrills(drills && Array.isArray(drills.drills) ? drills.drills : []);
     if (state) applyState(state);
+    const sharedGame = requestedGameId();
+    if (sharedGame) await openSharedGame(sharedGame);
     historyPanel?.refreshCount();
     bridgeStatus("ready", info);
     await pushAnalysisOptions();
     startEnginePolling();
+    startEventStream();
     startClockTicker();
 
     if (refs.bootError) refs.bootError.hidden = true;

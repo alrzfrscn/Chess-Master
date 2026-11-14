@@ -32,6 +32,48 @@ const bridge = {
 
 const isDesktop = new URLSearchParams(window.location.search).get("desktop") === "1";
 
+const CLIENT_KEY = "chess_master_client_id";
+const SESSION_KEY = "chess_master_session_id";
+
+function randomToken() {
+  if (window.crypto && typeof window.crypto.randomUUID === "function") {
+    return window.crypto.randomUUID().replace(/-/g, "");
+  }
+  const bytes = new Uint8Array(16);
+  if (window.crypto && typeof window.crypto.getRandomValues === "function") {
+    window.crypto.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.random() * 256;
+  }
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function storedToken(storage, key) {
+  try {
+    const existing = storage.getItem(key);
+    if (existing) return existing;
+    const created = randomToken();
+    storage.setItem(key, created);
+    return created;
+  } catch {
+    return randomToken();
+  }
+}
+
+/** Stable per browser; archive scoping and share links key off this. */
+export const clientId = storedToken(window.localStorage, CLIENT_KEY);
+/** Per tab, so two tabs never share a board. */
+export const sessionId = storedToken(window.sessionStorage, SESSION_KEY);
+
+function sessionHeaders(extra = {}) {
+  return {
+    Accept: "application/json",
+    "X-Chess-Session": sessionId,
+    "X-Chess-Client": clientId,
+    ...extra,
+  };
+}
+
 export function bridgeMode() {
   return bridge.mode;
 }
@@ -68,7 +110,7 @@ function waitForNative(timeoutMs = 6000) {
 async function httpHealth() {
   const response = await fetch("/api/health", {
     method: "GET",
-    headers: { Accept: "application/json" },
+    headers: sessionHeaders({ Accept: "application/json" }),
     cache: "no-store",
   });
   if (!response.ok) throw new Error(`Health check failed (${response.status}).`);
@@ -126,7 +168,7 @@ function unwrap(payload) {
 async function httpCall(method, args) {
   const response = await fetch(`/api/${encodeURIComponent(method)}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers: sessionHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ args, kwargs: {} }),
     cache: "no-store",
   });
@@ -179,4 +221,42 @@ export function detailLines(error) {
   if (typeof details.reason === "string") return details.reason;
   if (typeof details.ply === "number") return `Ply ${details.ply}`;
   return "";
+}
+
+/**
+ * Subscribe to the server's state fingerprint. Returns an unsubscribe function.
+ * Desktop and browsers without EventSource simply poll as before.
+ */
+export function subscribeEvents(handler) {
+  if (bridge.mode !== "http" || typeof window.EventSource !== "function") {
+    return () => {};
+  }
+  let source;
+  try {
+    source = new EventSource(`/api/events?session=${encodeURIComponent(sessionId)}`);
+  } catch {
+    return () => {};
+  }
+  source.addEventListener("state", (event) => {
+    try {
+      handler(JSON.parse(event.data));
+    } catch {
+      // A malformed frame only costs one fallback poll.
+    }
+  });
+  return () => source.close();
+}
+
+/** The archived game id a share link pointed at, if any. */
+export function requestedGameId() {
+  return new URLSearchParams(window.location.search).get("game");
+}
+
+/** Absolute share URL for an archived game, on whatever origin serves the page. */
+export function shareGameUrl(gameId) {
+  const url = new URL(window.location.href);
+  url.search = "";
+  url.hash = "";
+  url.searchParams.set("game", String(gameId));
+  return url.toString();
 }

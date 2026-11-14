@@ -4,6 +4,13 @@ PyWebView loads the UI from ``http://127.0.0.1:<port>/`` rather than ``file://``
 so ES modules, fetch and fonts behave exactly as they do in a browser. In normal
 desktop use the JS API goes through PyWebView; the HTTP ``/api`` route is only
 enabled for development and headless verification, never in the shipped window.
+
+Browser clients send ``X-Chess-Session`` / ``X-Chess-Client``; the server then
+routes the call to that session's isolated API through :class:`SessionManager`.
+Requests without a session header keep using the single ``self.api`` facade, so
+the desktop window and the existing HTTP tests are untouched.  ``GET
+/api/events`` streams a small state fingerprint whenever the session changes so
+the page can poll only when something actually happened.
 """
 
 from __future__ import annotations
@@ -13,18 +20,27 @@ import logging
 import mimetypes
 import sys
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
 from chess_master.bridge.api import ChessMasterApi
+from chess_master.bridge.sessions import (
+    SessionManager,
+    is_valid_client_id,
+    is_valid_session_id,
+)
 
 __all__ = ["WebAppServer"]
 
 logger = logging.getLogger(__name__)
 
 _MAX_BODY_BYTES = 2 * 1024 * 1024
+_EVENT_INTERVAL = 0.25
+_EVENT_HEARTBEAT = 15.0
 
 mimetypes.add_type("text/javascript", ".js")
 mimetypes.add_type("text/css", ".css")
@@ -55,12 +71,17 @@ class WebAppServer:
         host: str = "127.0.0.1",
         port: int = 0,
         expose_api: bool = False,
+        sessions: SessionManager | None = None,
     ) -> None:
         self.web_root = web_root.resolve()
         self.api = api
         self.host = host
         self._requested_port = port
         self.expose_api = expose_api
+        self.sessions = sessions
+        self._owns_sessions = False
+        self._sessions_lock = threading.Lock()
+        self._closing = threading.Event()
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._port = port
@@ -81,6 +102,7 @@ class WebAppServer:
     def start(self) -> str:
         if self._thread is not None:
             return self.url
+        self._closing.clear()
         httpd = self._bind()
         self._thread = threading.Thread(
             target=httpd.serve_forever,
@@ -92,14 +114,18 @@ class WebAppServer:
         return self.url
 
     def stop(self) -> None:
-        if self._httpd is None:
-            return
-        self._httpd.shutdown()
-        self._httpd.server_close()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-        self._httpd = None
-        self._thread = None
+        self._closing.set()
+        if self._httpd is not None:
+            self._httpd.shutdown()
+            self._httpd.server_close()
+            if self._thread is not None:
+                self._thread.join(timeout=2.0)
+            self._httpd = None
+            self._thread = None
+        if self._owns_sessions and self.sessions is not None:
+            self.sessions.close()
+            self.sessions = None
+            self._owns_sessions = False
 
     def serve_forever(self) -> None:
         """Run on the calling thread (used by ``--serve``)."""
@@ -110,11 +136,30 @@ class WebAppServer:
         finally:
             httpd.server_close()
 
+    # -- session routing -------------------------------------------------
+    def _api_for(self, session_header: str | None, client_header: str | None) -> ChessMasterApi:
+        """The session's API, or the default facade when no header was sent."""
+
+        raw = (session_header or "").strip()
+        if not raw:
+            return self.api
+        if not is_valid_session_id(raw):
+            raise ValueError("Invalid session id.")
+        client = (client_header or "").strip()
+        client = client if is_valid_client_id(client) else None
+        if self.sessions is None:
+            with self._sessions_lock:
+                if self.sessions is None:
+                    self.sessions = SessionManager(self.api)
+                    self._owns_sessions = True
+        return self.sessions.api_for(raw, client)
+
     # -- handler ---------------------------------------------------------
     def _make_handler(self) -> type[BaseHTTPRequestHandler]:
         root = self.web_root
         api = self.api
         expose_api = self.expose_api
+        server = self
         allowed_methods = {
             name
             for name in dir(api)
@@ -128,11 +173,14 @@ class WebAppServer:
                 logger.debug("HTTP %s - %s", self.address_string(), format % args)
 
             def do_GET(self) -> None:  # noqa: N802
-                path = urlparse(self.path).path
-                if path == "/api/health":
+                parsed = urlparse(self.path)
+                if parsed.path == "/api/health":
                     self._send_json(HTTPStatus.OK, api.get_api_info())
                     return
-                self._serve_static(path)
+                if parsed.path == "/api/events":
+                    self._serve_events(parsed.query)
+                    return
+                self._serve_static(parsed.path)
 
             def do_POST(self) -> None:  # noqa: N802
                 path = urlparse(self.path).path
@@ -210,7 +258,26 @@ class WebAppServer:
                     return
 
                 try:
-                    result = getattr(api, method_name)(*args, **kwargs)
+                    target = server._api_for(
+                        self.headers.get("X-Chess-Session"),
+                        self.headers.get("X-Chess-Client"),
+                    )
+                except ValueError:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "ok": False,
+                            "data": None,
+                            "error": {
+                                "code": "invalid_session",
+                                "message": "Use a 1-64 character session token.",
+                            },
+                        },
+                    )
+                    return
+
+                try:
+                    result = getattr(target, method_name)(*args, **kwargs)
                 except TypeError as exc:
                     result = {
                         "ok": False,
@@ -218,6 +285,77 @@ class WebAppServer:
                         "error": {"code": "invalid_request", "message": str(exc)},
                     }
                 self._send_json(HTTPStatus.OK, result)
+
+            # -- real-time stream --------------------------------------
+            def _serve_events(self, query: str) -> None:
+                if not expose_api:
+                    self._send_json(
+                        HTTPStatus.NOT_FOUND,
+                        {
+                            "ok": False,
+                            "data": None,
+                            "error": {
+                                "code": "api_disabled",
+                                "message": "The HTTP API is only available in development mode.",
+                            },
+                        },
+                    )
+                    return
+                requested = (parse_qs(query).get("session") or [""])[0]
+                try:
+                    target = server._api_for(
+                        requested or self.headers.get("X-Chess-Session"),
+                        self.headers.get("X-Chess-Client"),
+                    )
+                except ValueError:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "ok": False,
+                            "data": None,
+                            "error": {
+                                "code": "invalid_session",
+                                "message": "Use a 1-64 character session token.",
+                            },
+                        },
+                    )
+                    return
+
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                # shortcut: HTTP/1.0 close-delimited SSE on loopback only; use
+                # chunked HTTP/1.1 if a buffering proxy ever sits in front.
+
+                last: dict[str, Any] | None = None
+                last_sent = time.monotonic()
+                while not server._closing.is_set():
+                    snapshot = _state_fingerprint(target)
+                    if snapshot != last:
+                        last = snapshot
+                        last_sent = time.monotonic()
+                        if not self._write_event("state", snapshot):
+                            return
+                    elif time.monotonic() - last_sent >= _EVENT_HEARTBEAT:
+                        last_sent = time.monotonic()
+                        try:
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionError, OSError):
+                            return
+                    server._closing.wait(_EVENT_INTERVAL)
+
+            def _write_event(self, event: str, data: dict[str, Any]) -> bool:
+                body = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+                try:
+                    self.wfile.write(body.encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionError, OSError):
+                    return False
+                return True
 
             # -- static files -------------------------------------------
             def _serve_static(self, path: str) -> None:
@@ -257,3 +395,33 @@ class WebAppServer:
                 self.wfile.write(body)
 
         return Handler
+
+
+def _state_fingerprint(api: ChessMasterApi) -> dict[str, Any]:
+    """The smallest payload that tells a browser tab something changed."""
+
+    payload = api.get_game_state()
+    state = (payload.get("data") or {}) if isinstance(payload, dict) else {}
+    if not payload.get("ok"):
+        return {"ok": False, "error": (payload.get("error") or {}).get("code")}
+    engine = state.get("engine") or {}
+    evaluation = state.get("evaluation") or {}
+    review = state.get("review") or {}
+    progress = review.get("progress") or {}
+    return {
+        "ok": True,
+        "game_id": state.get("game_id"),
+        "revision": state.get("revision"),
+        "ply": state.get("ply"),
+        "total_plies": state.get("total_plies"),
+        "status": (state.get("status") or {}).get("state"),
+        "thinking": bool(engine.get("thinking")),
+        "engine_status": engine.get("status"),
+        "evaluation_updated_at": evaluation.get("updated_at"),
+        "depth": evaluation.get("depth"),
+        "score_text": evaluation.get("score_text"),
+        "review_status": review.get("status"),
+        "review_signature": review.get("signature"),
+        "review_done": progress.get("done"),
+        "review_total": progress.get("total"),
+    }

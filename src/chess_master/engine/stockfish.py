@@ -877,9 +877,11 @@ class StockfishManager:
 
         self._lock = threading.RLock()
         self._job_ready = threading.Condition(self._lock)
-        self._jobs: dict[str, EngineJob] = {}
-        self._latest_seq: dict[str, int] = {}
-        self._active_token: EngineToken | None = None
+        self._jobs: dict[str | tuple[str, str], EngineJob] = {}
+        self._latest_seq: dict[str | tuple[str, str], int] = {}
+        self._active_tokens: dict[str, EngineToken] = {}
+        # One listener per game lets several web sessions share this worker.
+        self._listeners: dict[str, Any] = {}
         self._current_job: EngineJob | None = None
         self._current_analysis: Any = None
         self._review_cancel = threading.Event()
@@ -944,6 +946,52 @@ class StockfishManager:
         self._on_review_progress = on_review_progress
         self._on_review_complete = on_review_complete
         self._on_error = on_error
+
+    # -- per-game listeners ----------------------------------------------
+    def set_listener(self, game_id: str, listener: Any) -> None:
+        """Route this game's callbacks to ``listener`` instead of the defaults.
+
+        The listener is any object exposing the coordinator callback names,
+        e.g. ``_on_analysis`` and ``_on_bot_move``.
+        """
+
+        with self._lock:
+            self._listeners[str(game_id)] = listener
+
+    def release_game(self, game_id: str) -> None:
+        """Forget a game's listener and drop its queued or active work."""
+
+        key_game = str(game_id)
+        stop_analysis = None
+        with self._lock:
+            self._listeners.pop(key_game, None)
+            self._active_tokens.pop(key_game, None)
+            for key in [
+                item
+                for item in self._jobs
+                if isinstance(item, tuple) and item[1] == key_game
+            ]:
+                self._jobs.pop(key, None)
+                self._latest_seq.pop(key, None)
+            current = self._current_job
+            if (
+                current is not None
+                and current.kind != "review"
+                and current.token.game_id == key_game
+            ):
+                stop_analysis = self._current_analysis
+            self._job_ready.notify_all()
+        if stop_analysis is not None:
+            try:
+                stop_analysis.stop()
+            except Exception:  # pragma: no cover - engine may already be gone
+                logger.debug("Could not cancel a released game's search", exc_info=True)
+
+    def _listener_for(self, game_id: str | None) -> Any:
+        if not game_id:
+            return None
+        with self._lock:
+            return self._listeners.get(str(game_id))
 
     # -- lifecycle -------------------------------------------------------
     def ensure_started(self) -> bool:
@@ -1030,17 +1078,29 @@ class StockfishManager:
     def set_active_token(self, token: EngineToken | None) -> None:
         stop_analysis = None
         with self._lock:
-            changed = token != self._active_token
-            self._active_token = token
-            if changed:
-                for kind, job in list(self._jobs.items()):
-                    if kind == "review":
-                        continue
-                    if job.token != token:
-                        self._jobs.pop(kind, None)
-                        self._latest_seq.pop(kind, None)
+            if token is None:
+                changed_games = set(self._active_tokens)
+                self._active_tokens.clear()
+            else:
+                previous = self._active_tokens.get(token.game_id)
+                changed_games = {token.game_id} if previous != token else set()
+                self._active_tokens[token.game_id] = token
+            if changed_games:
+                for key in [
+                    item
+                    for item in self._jobs
+                    if isinstance(item, tuple) and item[1] in changed_games
+                ]:
+                    if self._jobs[key].token != token:
+                        self._jobs.pop(key, None)
+                        self._latest_seq.pop(key, None)
                 current = self._current_job
-                if current is not None and current.kind != "review" and current.token != token:
+                if (
+                    current is not None
+                    and current.kind != "review"
+                    and current.token.game_id in changed_games
+                    and current.token != token
+                ):
                     stop_analysis = self._current_analysis
             self._job_ready.notify_all()
         if stop_analysis is not None:
@@ -1163,10 +1223,19 @@ class StockfishManager:
             self._seq += 1
             return EngineJob(kind=kind, token=token, **kwargs, seq=self._seq)
 
+    @staticmethod
+    def _job_key(kind: str, token: EngineToken) -> str | tuple[str, str]:
+        # Reviews stay a single global slot; analysis and bot work is per game.
+        # shortcut: one review runs process-wide and two tabs that open the same
+        # archived game_id share keys (newest wins). Per-session keys only matter
+        # if concurrent reviews or playing one archive from two tabs is wanted.
+        return "review" if kind == "review" else (kind, token.game_id)
+
     def _enqueue(self, job: EngineJob) -> None:
+        key = self._job_key(job.kind, job.token)
         with self._lock:
-            self._jobs[job.kind] = job
-            self._latest_seq[job.kind] = job.seq
+            self._jobs[key] = job
+            self._latest_seq[key] = job.seq
             self._job_ready.notify_all()
         self.ensure_started()
 
@@ -1179,14 +1248,19 @@ class StockfishManager:
                         self._job_ready.wait(0.5)
                     if self._stop_event.is_set():
                         break
-                    kind = (
-                        "bot"
-                        if "bot" in self._jobs
+                    bots = [
+                        item
+                        for item in self._jobs
+                        if isinstance(item, tuple) and item[0] == "bot"
+                    ]
+                    key = (
+                        bots[0]
+                        if bots
                         else "review"
                         if "review" in self._jobs
                         else next(iter(self._jobs))
                     )
-                    job = self._jobs.pop(kind)
+                    job = self._jobs.pop(key)
                     self._current_job = job
                     self._job_ready.notify_all()
 
@@ -1339,8 +1413,8 @@ class StockfishManager:
                     and self._latest_seq.get("review") == job.seq
                 )
             return (
-                self._active_token == job.token
-                and self._latest_seq.get(job.kind) == job.seq
+                self._active_tokens.get(job.token.game_id) == job.token
+                and self._latest_seq.get(self._job_key(job.kind, job.token)) == job.seq
             )
 
     def _build_board(self, job: EngineJob) -> chess.Board:
@@ -1610,8 +1684,18 @@ class StockfishManager:
         )
         return decorated
 
+    def _route(self, game_id: str | None, name: str) -> Callable[..., Any] | None:
+        """The per-game listener's callback, else the process-wide default."""
+
+        listener = self._listener_for(game_id)
+        if listener is not None:
+            callback = getattr(listener, name, None)
+            if callback is not None:
+                return callback
+        return getattr(self, name, None)
+
     def _emit_analysis(self, token: EngineToken, payload: dict[str, Any]) -> None:
-        callback = self._on_analysis
+        callback = self._route(token.game_id, "_on_analysis")
         if callback is None:
             return
         try:
@@ -1620,7 +1704,7 @@ class StockfishManager:
             logger.exception("Analysis callback failed")
 
     def _emit_bot_move(self, token: EngineToken, move: str, payload: dict[str, Any]) -> None:
-        callback = self._on_bot_move
+        callback = self._route(token.game_id, "_on_bot_move")
         if callback is None:
             return
         try:
@@ -1629,16 +1713,21 @@ class StockfishManager:
             logger.exception("Bot callback failed")
 
     def _emit_error(self, message: str) -> None:
-        callback = self._on_error
-        if callback is None:
-            return
-        try:
-            callback(message)
-        except Exception:  # pragma: no cover - callback isolation
-            logger.exception("Engine error callback failed")
+        # The process died for every session: tell the bound listeners too.
+        with self._lock:
+            listeners = list(self._listeners.values())
+        callbacks = [getattr(listener, "_on_error", None) for listener in listeners]
+        callbacks.append(self._on_error)
+        for callback in callbacks:
+            if callback is None:
+                continue
+            try:
+                callback(message)
+            except Exception:  # pragma: no cover - callback isolation
+                logger.exception("Engine error callback failed")
 
     def _emit_review_progress(self, payload: dict[str, Any]) -> None:
-        callback = self._on_review_progress
+        callback = self._route(payload.get("game_id"), "_on_review_progress")
         if callback is None:
             return
         try:
@@ -1647,7 +1736,7 @@ class StockfishManager:
             logger.exception("Review progress callback failed")
 
     def _emit_review_complete(self, payload: dict[str, Any]) -> None:
-        callback = self._on_review_complete
+        callback = self._route(payload.get("game_id"), "_on_review_complete")
         if callback is None:
             return
         try:

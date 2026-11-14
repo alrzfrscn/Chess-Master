@@ -54,6 +54,7 @@ GAME_COLUMNS: tuple[str, ...] = (
     "blunder_count",
     "review_preset",
     "review_signature",
+    "client_id",
 )
 
 # A plain re-archive (opening another game) carries no review metrics.  Keep the
@@ -108,7 +109,8 @@ CREATE TABLE IF NOT EXISTS games (
     brilliant_count INTEGER,
     blunder_count INTEGER,
     review_preset TEXT,
-    review_signature TEXT
+    review_signature TEXT,
+    client_id TEXT NOT NULL DEFAULT 'local'
 );
 CREATE TABLE IF NOT EXISTS reviews (
     game_id TEXT PRIMARY KEY,
@@ -154,8 +156,14 @@ class GameStore:
         """Add columns introduced after a database file was first created."""
 
         existing = {row[1] for row in self._conn.execute("PRAGMA table_info(games)")}
+        if "client_id" not in existing:
+            # Existing rows belong to the desktop client, never to a web visitor.
+            self._conn.execute(
+                "ALTER TABLE games ADD COLUMN client_id TEXT NOT NULL DEFAULT 'local'"
+            )
+            self._conn.execute("UPDATE games SET client_id = 'local' WHERE client_id IS NULL")
         for column in GAME_COLUMNS:
-            if column not in existing:
+            if column not in existing and column != "client_id":
                 self._conn.execute(f"ALTER TABLE games ADD COLUMN {column} TEXT")
 
     # -- games -----------------------------------------------------------
@@ -165,6 +173,7 @@ class GameStore:
             raise ValueError("An archived game needs a game_id.")
         row = {key: record.get(key) for key in GAME_COLUMNS}
         row["game_id"] = game_id
+        row["client_id"] = record.get("client_id") or "local"
         if not row.get("updated_at"):
             row["updated_at"] = _utc_now()
         columns = ", ".join(GAME_COLUMNS)
@@ -174,8 +183,11 @@ class GameStore:
             if column in _REVIEW_COLUMNS
             else f"{column} = excluded.{column}"
             for column in GAME_COLUMNS
-            if column != "game_id"
+            if column != "game_id" and column != "client_id"
         )
+        # The first client to archive a game keeps it, so opening a share link
+        # and replaying the game never moves it into the visitor's archive.
+        updates = f"{updates}, client_id = games.client_id"
         with self._lock:
             self._conn.execute(
                 f"INSERT INTO games ({columns}) VALUES ({placeholders}) "
@@ -202,9 +214,13 @@ class GameStore:
         offset: int = 0,
         mode: str | None = None,
         query: str | None = None,
+        client_id: str | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         where: list[str] = []
         params: list[Any] = []
+        if client_id:
+            where.append("COALESCE(client_id, 'local') = ?")
+            params.append(str(client_id))
         if mode:
             where.append("mode = ?")
             params.append(mode)
@@ -235,11 +251,24 @@ class GameStore:
             self._conn.commit()
             return cursor.rowcount > 0
 
-    def clear(self) -> int:
+    def clear(self, *, client_id: str | None = None) -> int:
         with self._lock:
-            deleted = int(self._conn.execute("SELECT COUNT(*) FROM games").fetchone()[0])
-            self._conn.execute("DELETE FROM reviews")
-            self._conn.execute("DELETE FROM games")
+            if client_id:
+                scope = "COALESCE(client_id, 'local') = ?"
+                count_sql = f"SELECT COUNT(*) FROM games WHERE {scope}"
+                deleted = int(
+                    self._conn.execute(count_sql, (str(client_id),)).fetchone()[0]
+                )
+                self._conn.execute(
+                    f"DELETE FROM reviews WHERE game_id IN "
+                    f"(SELECT game_id FROM games WHERE {scope})",
+                    (str(client_id),),
+                )
+                self._conn.execute(f"DELETE FROM games WHERE {scope}", (str(client_id),))
+            else:
+                deleted = int(self._conn.execute("SELECT COUNT(*) FROM games").fetchone()[0])
+                self._conn.execute("DELETE FROM reviews")
+                self._conn.execute("DELETE FROM games")
             self._conn.commit()
             self._conn.execute("VACUUM")
         return deleted
@@ -290,7 +319,9 @@ class GameStore:
         return record
 
     # -- diagnostics -----------------------------------------------------
-    def stats(self) -> dict[str, Any]:
+    def stats(self, *, client_id: str | None = None) -> dict[str, Any]:
+        scope = " WHERE COALESCE(client_id, 'local') = ?" if client_id else ""
+        params = (str(client_id),) if client_id else ()
         with self._lock:
             row = self._conn.execute(
                 "SELECT COUNT(*) AS total, "
@@ -303,7 +334,8 @@ class GameStore:
                 "THEN (white_accuracy + black_accuracy) / 2.0 END) AS avg_accuracy, "
                 "MAX(MAX(COALESCE(white_estimated_elo, 0), "
                 "COALESCE(black_estimated_elo, 0))) AS peak_elo "
-                "FROM games"
+                f"FROM games{scope}",
+                params,
             ).fetchone()
         data = dict(row) if row is not None else {}
         counts = {
@@ -321,17 +353,21 @@ class GameStore:
         counts["avg_accuracy"] = round(float(data.get("avg_accuracy") or 0.0), 1)
         return counts
 
-    def history_trend(self, *, limit: int = 12) -> list[dict[str, Any]]:
+    def history_trend(
+        self, *, limit: int = 12, client_id: str | None = None
+    ) -> list[dict[str, Any]]:
         """Reviewed games, oldest first, for the performance sparkline."""
 
         limit = max(1, min(int(limit), 50))
+        scope = " AND COALESCE(client_id, 'local') = ?" if client_id else ""
+        params: tuple[Any, ...] = (str(client_id), limit) if client_id else (limit,)
         with self._lock:
             rows = self._conn.execute(
                 "SELECT game_id, updated_at, white_name, black_name, result, "
                 "white_accuracy, black_accuracy, white_estimated_elo, black_estimated_elo "
-                "FROM games WHERE review_signature IS NOT NULL "
+                f"FROM games WHERE review_signature IS NOT NULL{scope} "
                 "ORDER BY updated_at DESC LIMIT ?",
-                (limit,),
+                params,
             ).fetchall()
         points: list[dict[str, Any]] = []
         for row in reversed(rows):

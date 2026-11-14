@@ -101,6 +101,7 @@ class EngineCoordinator:
             on_error=self._on_error,
         )
         self._token: EngineToken | None = None
+        self._listener_game_id: str | None = None
         self._analysis: dict[str, Any] | None = None
         self._pending_bot: dict[str, Any] | None = None
         self._bot_scheduled: EngineToken | None = None
@@ -149,6 +150,7 @@ class EngineCoordinator:
 
     def bind(self, session: "GameSession") -> EngineToken:
         token = self.token_for(session)
+        self._register_listener(token.game_id)
         with self._lock:
             self._reset_review()
             self._reset_for(token)
@@ -167,6 +169,7 @@ class EngineCoordinator:
         """Re-point the engine at the session's current revision and schedule."""
 
         token = self.token_for(session)
+        self._register_listener(token.game_id)
         self._invalidate_review_if_needed(session)
         self._apply_sync_options(
             analysis_enabled=analysis_enabled,
@@ -780,8 +783,28 @@ class EngineCoordinator:
             self._pending_bot = None
             self._review = None
             self._review_report = None
+        self.detach()
         self._worker.cancel_review()
         self._worker.stop()
+
+    def detach(self) -> None:
+        """Stop listening to a shared worker without stopping it."""
+
+        release = getattr(self._worker, "release_game", None)
+        if release is not None and self._listener_game_id is not None:
+            release(self._listener_game_id)
+        self._listener_game_id = None
+
+    def _register_listener(self, game_id: str) -> None:
+        """Bind this coordinator to a shared worker's callbacks for one game."""
+
+        register = getattr(self._worker, "set_listener", None)
+        if register is None:
+            return
+        if self._listener_game_id not in (None, game_id):
+            self.detach()
+        self._listener_game_id = game_id
+        register(game_id, self)
 
     # -- worker callbacks ------------------------------------------------
     def _on_analysis(self, token: EngineToken, payload: dict[str, Any]) -> None:
