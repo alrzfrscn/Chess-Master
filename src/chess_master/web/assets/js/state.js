@@ -93,6 +93,7 @@ export function isPromotion(fen, from, to) {
 export function modeTitle(game) {
   if (!game) return "Pass & Play";
   if (game.mode === "stockfish") return "Play vs Stockfish";
+  if (game.mode === "online") return "Online Room";
   if (game.mode === "import") {
     if (game.source === "fen") return "Position Study";
     return "Imported Study";
@@ -103,6 +104,11 @@ export function modeTitle(game) {
 /** In an engine game the human may only move on their own turn. */
 export function canHumanMove(game) {
   if (!game || !game.status || game.status.state !== "in_progress") return false;
+  const room = game.room;
+  if (room) {
+    if (room.status !== "active" || !room.seat) return false;
+    return game.turn === room.seat;
+  }
   if (game.mode !== "stockfish") return true;
   const bot = game.engine && game.engine.bot_color;
   return !bot || game.turn !== bot;
@@ -148,12 +154,16 @@ export function positionTitle(game) {
   if (status.state === "timeout") {
     return `${titleCase(status.winner)} wins on time`;
   }
+  if (status.state === "resigned") {
+    return `${titleCase(status.winner)} wins by resignation`;
+  }
   if (status.state === "draw") {
     const reasons = {
       stalemate: "Stalemate",
       insufficient_material: "Draw — insufficient material",
       seventyfive_moves: "Draw — 75-move rule",
       fivefold_repetition: "Draw — fivefold repetition",
+      agreement: "Draw — by agreement",
     };
     return reasons[status.reason] || "Draw";
   }
@@ -165,7 +175,10 @@ export function turnDescription(game) {
   if (!game) return "White to move";
   if (game.status.state === "checkmate") return `${titleCase(game.status.winner)} wins by checkmate`;
   if (game.status.state === "timeout") return `${titleCase(game.status.winner)} wins on time`;
-  if (game.status.state === "draw") return "The game is drawn";
+  if (game.status.state === "resigned") return `${titleCase(game.status.winner)} wins by resignation`;
+  if (game.status.state === "draw") {
+    return game.status.reason === "agreement" ? "The players agreed a draw" : "The game is drawn";
+  }
   if (game.engine && game.engine.thinking) return "Stockfish is thinking…";
   return `${titleCase(game.turn)} to move${game.status.check ? " · check" : ""}`;
 }
@@ -192,8 +205,13 @@ export function sessionEvent(game) {
   if (game.status.state === "timeout") {
     return `${titleCase(game.status.winner)} won on time`;
   }
+  if (game.status.state === "resigned") {
+    return `${titleCase(game.status.winner)} won by resignation`;
+  }
   if (game.status.state === "draw") {
-    return "The game ended in a draw";
+    return game.status.reason === "agreement"
+      ? "The players agreed a draw"
+      : "The game ended in a draw";
   }
   if (game.ply < game.total_plies) {
     return `Reviewing ply ${game.ply} of ${game.total_plies}`;

@@ -1,6 +1,6 @@
 /** Application entry point: bridge boot, state rendering, input routing. */
 
-import { call, connect, detailLines, errorMessage, requestedGameId, subscribeEvents } from "./api.js";
+import { call, connect, detailLines, errorMessage, requestedGameId, requestedRoomId, shareRoomUrl, subscribeEvents } from "./api.js";
 import { BoardController } from "./board.js";
 import { EditorPanel } from "./editorPanel.js";
 import { OpeningExplorer } from "./explorer.js";
@@ -20,7 +20,7 @@ import {
   sourceLabel,
   titleCase,
 } from "./state.js";
-import { askConfirm, closeDialog, openDialog, TabController, toast } from "./ui.js";
+import { askConfirm, closeDialog, copyText, openDialog, TabController, toast } from "./ui.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -65,6 +65,17 @@ const refs = {
   reviewCtaCopy: $("review-cta-copy-text"),
   reviewCtaButton: $("btn-review-cta"),
   reviewCtaLabel: $("btn-review-cta-label"),
+  roomBanner: $("room-banner"),
+  roomCode: $("room-code"),
+  roomStatus: $("room-status"),
+  roomSeat: $("room-seat"),
+  roomInvite: $("room-invite"),
+  copyRoomButton: $("btn-copy-room"),
+  rematchRoomButton: $("btn-rematch-room"),
+  drawBanner: $("draw-banner"),
+  drawBannerText: $("draw-banner-text"),
+  acceptDrawButton: $("btn-accept-draw"),
+  declineDrawButton: $("btn-decline-draw"),
 };
 
 refs.players = { top: refs.topPlayer, bottom: refs.bottomPlayer };
@@ -131,6 +142,7 @@ function renderAll() {
   renderSession(game);
   renderModeNav(game);
   renderEval(game);
+  renderRoom(game);
 
   panel.setGame(game);
   if (app.activeTab === "import") panel.refreshExport();
@@ -153,7 +165,7 @@ function renderAll() {
   const pageEvent = String(game.event || modeTitle(game)).replace(/^Chess Master\s*[—–-]\s*/i, "");
   document.title = `Chess Master — ${pageEvent}`;
   const resetButton = document.querySelector('[data-action="reset"]');
-  if (resetButton) resetButton.disabled = game.total_plies === 0;
+  if (resetButton) resetButton.disabled = game.total_plies === 0 || Boolean(game.room);
 
   window.dispatchEvent(new CustomEvent("chessmaster:state", { detail: game }));
 }
@@ -181,6 +193,11 @@ function stateFingerprint(state) {
     state.review && state.review.signature ? state.review.signature : "",
     state.review && state.review.progress ? state.review.progress.done : "",
     state.review && state.review.progress ? state.review.progress.total : "",
+    state.room ? state.room.room_id : "",
+    state.room ? state.room.status : "",
+    state.room ? state.room.seat : "",
+    state.room ? state.room.rematch_available : "",
+    state.status ? state.status.draw_offer_by : "",
   ].join("|");
 }
 
@@ -291,7 +308,9 @@ function applyState(state, { autoOrient = false } = {}) {
   app.game = state;
   app.evaluation = state.evaluation || null;
   app.engine = state.engine || null;
-  if (autoOrient && state.orientation) app.orientation = state.orientation;
+  const seat = state.room?.seat;
+  if (seat && (autoOrient || gameChanged)) app.orientation = seat;
+  else if (autoOrient && state.orientation) app.orientation = state.orientation;
   app.pendingPromotion = null;
   board.clearPromotion();
   hidePromotion();
@@ -339,6 +358,52 @@ function renderReviewCta(game) {
   }
   if (refs.reviewCtaLabel) {
     refs.reviewCtaLabel.textContent = complete ? "Open Game Review" : "Analyze in Game Review";
+  }
+}
+
+function renderRoom(game) {
+  const room = game && game.room ? game.room : null;
+  const status = (game && game.status) || {};
+  const seat = room?.seat || null;
+  const live = Boolean(room && room.status === "active" && status.state === "in_progress");
+  if (refs.roomBanner) refs.roomBanner.hidden = !room;
+  const drawButton = document.querySelector('[data-action="draw"]');
+  const resignButton = document.querySelector('[data-action="resign"]');
+  if (drawButton) drawButton.hidden = !(live && seat);
+  if (resignButton) resignButton.hidden = !(live && seat);
+  if (refs.rematchRoomButton) {
+    refs.rematchRoomButton.hidden = !(room && room.rematch_available && seat);
+  }
+  if (!room) {
+    if (refs.drawBanner) refs.drawBanner.hidden = true;
+    return;
+  }
+  if (refs.roomCode) refs.roomCode.textContent = room.room_id;
+  if (refs.roomSeat) {
+    refs.roomSeat.textContent = seat ? `You play ${titleCase(seat)}` : "Spectator";
+  }
+  if (refs.roomStatus) {
+    refs.roomStatus.textContent =
+      room.status === "waiting"
+        ? "Waiting for a friend to join…"
+        : room.status === "finished"
+          ? "Game over — rematch or review"
+          : "Live room · fair play on";
+  }
+  if (refs.roomInvite) refs.roomInvite.value = shareRoomUrl(room.room_id);
+
+  const offer = status.draw_offer_by;
+  const showOffer = Boolean(offer && seat);
+  if (refs.drawBanner) refs.drawBanner.hidden = !showOffer;
+  if (showOffer) {
+    const mine = offer === seat;
+    if (refs.drawBannerText) {
+      refs.drawBannerText.textContent = mine
+        ? "Draw offer sent — waiting for your opponent."
+        : "Your opponent offers a draw.";
+    }
+    if (refs.acceptDrawButton) refs.acceptDrawButton.hidden = mine;
+    if (refs.declineDrawButton) refs.declineDrawButton.hidden = mine;
   }
 }
 
@@ -422,6 +487,16 @@ function announceOutcome(previous, next) {
     toast({
       title: "Time forfeit",
       description: `${titleCase(next.status.winner)} wins on time.`,
+      kind: "warning",
+      duration: 6500,
+    });
+    return;
+  }
+  if (next.status.state === "resigned") {
+    sound.play("game_over");
+    toast({
+      title: "Resignation",
+      description: `${titleCase(next.status.winner)} wins by resignation.`,
       kind: "warning",
       duration: 6500,
     });
@@ -681,7 +756,8 @@ const PACE_BY_TIME_CONTROL = {
 function openNewGame(mode = null) {
   if (!refs.newGameDialog) return;
   const game = app.game;
-  const target = mode || (game && game.mode === "stockfish" ? "stockfish" : "pass_play");
+  const current = game && (game.mode === "stockfish" || game.mode === "online") ? game.mode : "pass_play";
+  const target = mode || current;
   app.newMode = target;
 
   const whiteInput = $("new-white-name");
@@ -707,7 +783,12 @@ function openNewGame(mode = null) {
   syncNewGameForm();
   openDialog(refs.newGameDialog);
   requestAnimationFrame(() => {
-    const input = app.newMode === "stockfish" ? humanInput : whiteInput;
+    const input =
+      app.newMode === "online"
+        ? $("new-room-code")
+        : app.newMode === "stockfish"
+          ? humanInput
+          : whiteInput;
     input?.focus();
     input?.select?.();
   });
@@ -715,6 +796,7 @@ function openNewGame(mode = null) {
 
 function syncNewGameForm() {
   const stockfish = app.newMode === "stockfish";
+  const online = app.newMode === "online";
   for (const button of document.querySelectorAll("[data-new-mode]")) {
     const selected = button.dataset.newMode === app.newMode;
     button.classList.toggle("is-active", selected);
@@ -722,8 +804,10 @@ function syncNewGameForm() {
   }
   const passFields = $("new-pass-fields");
   const engineFields = $("new-stockfish-fields");
-  if (passFields) passFields.hidden = stockfish;
+  const onlineFields = $("new-online-fields");
+  if (passFields) passFields.hidden = app.newMode !== "pass_play";
   if (engineFields) engineFields.hidden = !stockfish;
+  if (onlineFields) onlineFields.hidden = !online;
 
   for (const button of document.querySelectorAll("#new-time-control [data-time-control]")) {
     const selected = button.dataset.timeControl === app.newTimeControl;
@@ -772,13 +856,31 @@ function syncNewGameForm() {
   const warning = $("new-engine-warning");
   if (warning) warning.hidden = !stockfish || !isEngineOffline(app.engine);
   const start = $("btn-start-game");
-  if (start) start.textContent = stockfish ? "Start engine match" : "Start game";
+  if (start) start.textContent = online ? "Create room" : stockfish ? "Start engine match" : "Start game";
 }
 
 async function startNewGame(event) {
   event.preventDefault();
   if (app.busy) return;
   const mode = app.newMode;
+  if (mode === "online") {
+    const timeControl = app.newTimeControl === "unlimited" ? null : app.newTimeControl;
+    const state = await withBusy(() => call("create_room", { time_control: timeControl }), {
+      closeDialogAfter: refs.newGameDialog,
+      autoOrient: true,
+    });
+    if (!state) return;
+    toast({
+      title: "Room ready",
+      description: `Code ${state.room?.room_id || ""}. Share the invite link; your friend joins as Black.`,
+      kind: "success",
+      duration: 8000,
+    });
+    tabs.setActive("moves");
+    pollSoon(80);
+    window.dispatchEvent(new CustomEvent("chessmaster:newgame"));
+    return;
+  }
   let options;
   if (mode === "stockfish") {
     const human = ($("new-human-name")?.value || "").trim() || "Player";
@@ -844,6 +946,75 @@ async function resetGame() {
     successDescription: "The starting position is back on the board.",
   });
   if (reset) tabs.setActive("moves");
+}
+
+async function joinRoom(code) {
+  const roomCode = String(code || "").trim().toLowerCase();
+  if (!roomCode || app.busy) return null;
+  const state = await withBusy(() => call("join_room", roomCode), {
+    closeDialogAfter: refs.newGameDialog,
+    autoOrient: true,
+    successTitle: "Room joined",
+    successDescription: "The shared table is on the board.",
+  });
+  if (state) {
+    tabs.setActive("moves");
+    if (state.room && state.room.spectator) {
+      toast({
+        title: "Spectating",
+        description: "Both seats are taken, so the board is read-only.",
+        kind: "info",
+        duration: 6000,
+      });
+    }
+    pollSoon(60);
+    window.dispatchEvent(new CustomEvent("chessmaster:newgame"));
+  }
+  return state;
+}
+
+async function rematchRoom() {
+  if (!app.game || app.busy) return;
+  const state = await withBusy(() => call("rematch_room"), {
+    autoOrient: true,
+    successTitle: "Rematch",
+    successDescription: "Colors swapped and the clocks are reset.",
+  });
+  if (state) {
+    tabs.setActive("moves");
+    pollSoon(60);
+  }
+}
+
+async function resignGame() {
+  if (!app.game || app.busy) return;
+  const previous = app.game;
+  const confirmed = await askConfirm(refs.confirmDialog, {
+    eyebrow: "Resign",
+    title: "Resign this game?",
+    copy: "Your opponent wins immediately and the game is archived for review.",
+    acceptLabel: "Resign",
+  });
+  if (!confirmed) return;
+  const state = await withBusy(() => call("resign_game"), {});
+  if (state) {
+    sound.play("game_over");
+    announceOutcome(previous, state);
+  }
+}
+
+async function drawAction(action) {
+  if (!app.game || app.busy) return;
+  const previous = app.game;
+  const state = await withBusy(() => call("offer_or_accept_draw", action), {});
+  if (!state) return;
+  if (action === "offer") {
+    toast({ title: "Draw offered", description: "Waiting for your opponent to answer.", kind: "info" });
+  } else if (action === "decline") {
+    toast({ title: "Draw declined", description: "The game continues.", kind: "info" });
+  } else {
+    announceOutcome(previous, state);
+  }
 }
 
 function composeError(error) {
@@ -1200,6 +1371,30 @@ function wireShell() {
     reviewPanel?.focusOrStart();
   });
   $("new-game-form")?.addEventListener("submit", startNewGame);
+  $("btn-join-room")?.addEventListener("click", () => {
+    joinRoom($("new-room-code")?.value || "");
+  });
+  $("new-room-code")?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    joinRoom(event.target.value || "");
+  });
+  refs.copyRoomButton?.addEventListener("click", async () => {
+    const roomId = app.game?.room?.room_id;
+    if (!roomId) return;
+    const copied = await copyText(shareRoomUrl(roomId));
+    toast({
+      title: copied ? "Invite copied" : "Invite link",
+      description: copied
+        ? "Send it to your friend; they join as Black."
+        : shareRoomUrl(roomId),
+      kind: copied ? "success" : "info",
+      duration: 6000,
+    });
+  });
+  refs.rematchRoomButton?.addEventListener("click", rematchRoom);
+  refs.acceptDrawButton?.addEventListener("click", () => drawAction("accept"));
+  refs.declineDrawButton?.addEventListener("click", () => drawAction("decline"));
   $("engine-form")?.addEventListener("submit", configureEngine);
   $("btn-engine-auto")?.addEventListener("click", autoDetectEngine);
   $("btn-engine-config")?.addEventListener("click", openEngineDialog);
@@ -1277,6 +1472,8 @@ function wireShell() {
       const action = button.dataset.action;
       if (action === "flip") flipBoard();
       if (action === "reset") resetGame();
+      if (action === "draw") drawAction("offer");
+      if (action === "resign") resignGame();
       if (action === "eval") toggleEval();
       if (action === "arrows") toggleArrows();
       if (action === "sound") toggleSound();
@@ -1340,6 +1537,11 @@ function wireShell() {
     getEditorPanel: () => editorPanel,
     getDrills: () => editorPanel?.drills || [],
     startDrill: (drillId) => call("start_drill", drillId),
+    createRoom: (options) => call("create_room", options),
+    joinRoom,
+    rematchRoom,
+    resignGame,
+    drawAction,
     launchEditorPosition,
     searchOpenings: (query, ecoPrefix, limit) => call("search_openings", query, ecoPrefix, limit),
     studyOpeningLine,
@@ -1485,6 +1687,8 @@ async function bootstrap() {
     if (state) applyState(state);
     const sharedGame = requestedGameId();
     if (sharedGame) await openSharedGame(sharedGame);
+    const sharedRoom = requestedRoomId();
+    if (sharedRoom) await joinRoom(sharedRoom);
     historyPanel?.refreshCount();
     bridgeStatus("ready", info);
     await pushAnalysisOptions();

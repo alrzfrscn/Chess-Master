@@ -843,6 +843,7 @@ class EngineJob:
     use_cache: bool = True
     review: ReviewRequest | None = None
     seq: int = 0
+    owner: str = "local"
 
 
 EngineFactory = Callable[[str], Any]
@@ -877,15 +878,15 @@ class StockfishManager:
 
         self._lock = threading.RLock()
         self._job_ready = threading.Condition(self._lock)
-        self._jobs: dict[str | tuple[str, str], EngineJob] = {}
-        self._latest_seq: dict[str | tuple[str, str], int] = {}
+        self._jobs: dict[tuple[str, str], EngineJob] = {}
+        self._latest_seq: dict[tuple[str, str], int] = {}
         self._active_tokens: dict[str, EngineToken] = {}
-        # One listener per game lets several web sessions share this worker.
+        # One listener per coordinator lets several web sessions share this worker.
         self._listeners: dict[str, Any] = {}
         self._current_job: EngineJob | None = None
         self._current_analysis: Any = None
-        self._review_cancel = threading.Event()
-        self._last_review_run_id: int | None = None
+        self._review_cancel: dict[str, threading.Event] = {}
+        self._review_run_ids: dict[str, int | None] = {}
         self._thread: threading.Thread | None = None
         self._start_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -927,10 +928,9 @@ class StockfishManager:
     def cache(self) -> AnalysisCache:
         return self._cache
 
-    @property
-    def review_run_id(self) -> int | None:
+    def review_run_id(self, owner: str = "local") -> int | None:
         with self._lock:
-            return self._last_review_run_id
+            return self._review_run_ids.get(str(owner))
 
     def set_callbacks(
         self,
@@ -947,51 +947,45 @@ class StockfishManager:
         self._on_review_complete = on_review_complete
         self._on_error = on_error
 
-    # -- per-game listeners ----------------------------------------------
-    def set_listener(self, game_id: str, listener: Any) -> None:
-        """Route this game's callbacks to ``listener`` instead of the defaults.
+    # -- per-coordinator listeners ---------------------------------------
+    def set_listener(self, owner: str, listener: Any) -> None:
+        """Route this coordinator's callbacks to ``listener``.
 
         The listener is any object exposing the coordinator callback names,
         e.g. ``_on_analysis`` and ``_on_bot_move``.
         """
 
         with self._lock:
-            self._listeners[str(game_id)] = listener
+            self._listeners[str(owner)] = listener
 
-    def release_game(self, game_id: str) -> None:
-        """Forget a game's listener and drop its queued or active work."""
+    def release_owner(self, owner: str) -> None:
+        """Forget a coordinator's listener and drop its queued or active work."""
 
-        key_game = str(game_id)
+        key_owner = str(owner)
         stop_analysis = None
         with self._lock:
-            self._listeners.pop(key_game, None)
-            self._active_tokens.pop(key_game, None)
-            for key in [
-                item
-                for item in self._jobs
-                if isinstance(item, tuple) and item[1] == key_game
-            ]:
+            self._listeners.pop(key_owner, None)
+            self._active_tokens.pop(key_owner, None)
+            self._review_cancel.pop(key_owner, None)
+            self._review_run_ids.pop(key_owner, None)
+            for key in [item for item in self._jobs if item[0] == key_owner]:
                 self._jobs.pop(key, None)
                 self._latest_seq.pop(key, None)
             current = self._current_job
-            if (
-                current is not None
-                and current.kind != "review"
-                and current.token.game_id == key_game
-            ):
+            if current is not None and current.owner == key_owner and current.kind != "review":
                 stop_analysis = self._current_analysis
             self._job_ready.notify_all()
         if stop_analysis is not None:
             try:
                 stop_analysis.stop()
             except Exception:  # pragma: no cover - engine may already be gone
-                logger.debug("Could not cancel a released game's search", exc_info=True)
+                logger.debug("Could not cancel a released owner's search", exc_info=True)
 
-    def _listener_for(self, game_id: str | None) -> Any:
-        if not game_id:
+    def _listener_for(self, owner: str | None) -> Any:
+        if not owner:
             return None
         with self._lock:
-            return self._listeners.get(str(game_id))
+            return self._listeners.get(str(owner))
 
     # -- lifecycle -------------------------------------------------------
     def ensure_started(self) -> bool:
@@ -1001,7 +995,9 @@ class StockfishManager:
             if self._thread is not None and self._thread.is_alive():
                 return True
             self._stop_event.clear()
-            self._review_cancel.clear()
+            with self._lock:
+                for event in self._review_cancel.values():
+                    event.clear()
             self._thread = threading.Thread(
                 target=self._worker_loop,
                 name="chess-master-stockfish",
@@ -1035,7 +1031,8 @@ class StockfishManager:
     def stop(self, timeout: float = 2.0) -> None:
         with self._lock:
             self._stop_event.set()
-            self._review_cancel.set()
+            for event in self._review_cancel.values():
+                event.set()
             self._jobs.clear()
             self._latest_seq.clear()
             analysis = self._current_analysis
@@ -1075,21 +1072,24 @@ class StockfishManager:
         return self.status_payload()
 
     # -- scheduling ------------------------------------------------------
-    def set_active_token(self, token: EngineToken | None) -> None:
+    def set_active_token(self, token: EngineToken | None, owner: str = "local") -> None:
+        key_owner = str(owner)
         stop_analysis = None
         with self._lock:
+            previous = self._active_tokens.get(key_owner)
             if token is None:
-                changed_games = set(self._active_tokens)
-                self._active_tokens.clear()
+                changed = previous is not None
+                self._active_tokens.pop(key_owner, None)
             else:
-                previous = self._active_tokens.get(token.game_id)
-                changed_games = {token.game_id} if previous != token else set()
-                self._active_tokens[token.game_id] = token
-            if changed_games:
+                changed = previous != token
+                self._active_tokens[key_owner] = token
+            if changed:
+                # A review belongs to the game line, not to the current view, so
+                # a new revision never drops it.
                 for key in [
                     item
                     for item in self._jobs
-                    if isinstance(item, tuple) and item[1] in changed_games
+                    if item[0] == key_owner and item[1] != "review"
                 ]:
                     if self._jobs[key].token != token:
                         self._jobs.pop(key, None)
@@ -1097,8 +1097,8 @@ class StockfishManager:
                 current = self._current_job
                 if (
                     current is not None
+                    and current.owner == key_owner
                     and current.kind != "review"
-                    and current.token.game_id in changed_games
                     and current.token != token
                 ):
                     stop_analysis = self._current_analysis
@@ -1119,6 +1119,7 @@ class StockfishManager:
         multipv: int = DEFAULT_MULTIPV,
         movetime: float | None = None,
         use_cache: bool = True,
+        owner: str = "local",
     ) -> str:
         if not self.available:
             return "unavailable"
@@ -1127,12 +1128,13 @@ class StockfishManager:
             cached = self._cache.get(token.fen, depth, multipv)
             if cached is not None:
                 payload = self._decorate(cached, token)
-                self._emit_analysis(token, payload)
+                self._emit_analysis(str(owner), token, payload)
                 return "cache"
 
         job = self._make_job(
             "analysis",
             token,
+            owner=str(owner),
             start_fen=start_fen,
             moves=moves,
             depth=depth,
@@ -1150,6 +1152,7 @@ class StockfishManager:
         start_fen: str,
         moves: Sequence[str],
         elo: int,
+        owner: str = "local",
     ) -> str:
         if not self.available:
             return "unavailable"
@@ -1157,6 +1160,7 @@ class StockfishManager:
         job = self._make_job(
             "bot",
             token,
+            owner=str(owner),
             start_fen=start_fen,
             moves=moves,
             depth=profile.depth,
@@ -1176,14 +1180,16 @@ class StockfishManager:
             return "unavailable"
         if not isinstance(request, ReviewRequest):
             raise TypeError("submit_review expects a ReviewRequest")
-        # A second review supersedes the first immediately.
-        self.cancel_review()
+        owner = str(request.owner)
+        # A second review from the same coordinator supersedes the first.
+        self.cancel_review(owner)
         with self._lock:
-            self._review_cancel.clear()
+            self._review_cancel.setdefault(owner, threading.Event()).clear()
         token = EngineToken(request.game_id, 0, 0, request.start_fen)
         job = self._make_job(
             "review",
             token,
+            owner=owner,
             start_fen=request.start_fen,
             moves=tuple(request.moves),
             depth=request.base_depth,
@@ -1192,22 +1198,28 @@ class StockfishManager:
             review=request,
         )
         with self._lock:
-            self._last_review_run_id = job.seq
+            self._review_run_ids[owner] = job.seq
         self._enqueue(job)
         return "queued"
 
-    def cancel_review(self) -> bool:
+    def cancel_review(self, owner: str = "local") -> bool:
         """Cancel a queued or running review without touching other jobs."""
 
+        key_owner = str(owner)
         analysis = None
         cancelled = False
         with self._lock:
-            queued = self._jobs.pop("review", None) is not None
-            running = self._current_job is not None and self._current_job.kind == "review"
+            key = (key_owner, "review")
+            queued = self._jobs.pop(key, None) is not None
+            running = (
+                self._current_job is not None
+                and self._current_job.kind == "review"
+                and self._current_job.owner == key_owner
+            )
             if queued or running:
-                self._review_cancel.set()
+                self._review_cancel.setdefault(key_owner, threading.Event()).set()
                 cancelled = True
-            self._latest_seq.pop("review", None)
+            self._latest_seq.pop(key, None)
             if running:
                 analysis = self._current_analysis
             self._job_ready.notify_all()
@@ -1224,15 +1236,13 @@ class StockfishManager:
             return EngineJob(kind=kind, token=token, **kwargs, seq=self._seq)
 
     @staticmethod
-    def _job_key(kind: str, token: EngineToken) -> str | tuple[str, str]:
-        # Reviews stay a single global slot; analysis and bot work is per game.
-        # shortcut: one review runs process-wide and two tabs that open the same
-        # archived game_id share keys (newest wins). Per-session keys only matter
-        # if concurrent reviews or playing one archive from two tabs is wanted.
-        return "review" if kind == "review" else (kind, token.game_id)
+    def _job_key(owner: str, kind: str) -> tuple[str, str]:
+        # One coalesced job per coordinator and kind. Different coordinators
+        # never overwrite each other's queued work.
+        return (str(owner), str(kind))
 
     def _enqueue(self, job: EngineJob) -> None:
-        key = self._job_key(job.kind, job.token)
+        key = self._job_key(job.owner, job.kind)
         with self._lock:
             self._jobs[key] = job
             self._latest_seq[key] = job.seq
@@ -1248,18 +1258,11 @@ class StockfishManager:
                         self._job_ready.wait(0.5)
                     if self._stop_event.is_set():
                         break
-                    bots = [
-                        item
-                        for item in self._jobs
-                        if isinstance(item, tuple) and item[0] == "bot"
-                    ]
-                    key = (
-                        bots[0]
-                        if bots
-                        else "review"
-                        if "review" in self._jobs
-                        else next(iter(self._jobs))
-                    )
+                    # Bots first so a human never waits on a background review;
+                    # everything else is FIFO across coordinators.
+                    bots = [key for key in self._jobs if key[1] == "bot"]
+                    candidates = bots or list(self._jobs)
+                    key = min(candidates, key=lambda item: self._jobs[item].seq)
                     job = self._jobs.pop(key)
                     self._current_job = job
                     self._job_ready.notify_all()
@@ -1405,17 +1408,14 @@ class StockfishManager:
         with self._lock:
             if self._stop_event.is_set():
                 return False
+            if self._latest_seq.get(self._job_key(job.owner, job.kind)) != job.seq:
+                return False
             if job.kind == "review":
                 # A review belongs to the game line, not to the current view:
                 # navigating through history must never cancel it.
-                return (
-                    not self._review_cancel.is_set()
-                    and self._latest_seq.get("review") == job.seq
-                )
-            return (
-                self._active_tokens.get(job.token.game_id) == job.token
-                and self._latest_seq.get(self._job_key(job.kind, job.token)) == job.seq
-            )
+                event = self._review_cancel.get(job.owner)
+                return event is not None and not event.is_set()
+            return self._active_tokens.get(job.owner) == job.token
 
     def _build_board(self, job: EngineJob) -> chess.Board:
         board = chess.Board(job.start_fen)
@@ -1491,7 +1491,7 @@ class StockfishManager:
         if job.use_cache:
             cached = self._cache.get(job.token.fen, job.depth, job.multipv)
             if cached is not None:
-                self._emit_analysis(job.token, self._decorate(cached, job.token))
+                self._emit_analysis(job.owner, job.token, self._decorate(cached, job.token))
                 return
         if board.is_checkmate() or board.is_stalemate() or board.is_insufficient_material():
             payload = terminal_evaluation(
@@ -1502,7 +1502,7 @@ class StockfishManager:
             )
             if job.use_cache:
                 self._cache.put(job.token.fen, job.depth, payload)
-            self._emit_analysis(job.token, payload)
+            self._emit_analysis(job.owner, job.token, payload)
             return
 
         self._configure_analysis(engine, job.multipv)
@@ -1522,7 +1522,7 @@ class StockfishManager:
             self._cache.put(job.token.fen, job.depth, payload)
         if not self._job_is_current(job):
             return
-        self._emit_analysis(job.token, payload)
+        self._emit_analysis(job.owner, job.token, payload)
 
     def _run_bot(self, engine: Any, job: EngineJob) -> None:
         board = self._build_board(job)
@@ -1561,7 +1561,7 @@ class StockfishManager:
             return
         if not self._job_is_current(job):
             return
-        self._emit_bot_move(job.token, move.uci(), payload or {})
+        self._emit_bot_move(job.owner, job.token, move.uci(), payload or {})
 
     @staticmethod
     def _first_pv_move(infos: Sequence[Mapping[str, Any]], board: chess.Board) -> chess.Move | None:
@@ -1641,7 +1641,9 @@ class StockfishManager:
         def progress(payload: dict[str, Any]) -> None:
             if not self._job_is_current(job):
                 return
-            self._emit_review_progress({**base, **payload, "status": "running"})
+            self._emit_review_progress(
+                job.owner, {**base, **payload, "status": "running"}
+            )
 
         try:
             report = run_game_review(
@@ -1653,22 +1655,27 @@ class StockfishManager:
                 engine_version=self.version,
             )
         except ReviewCancelled:
-            self._emit_review_complete({**base, "available": True, "status": "cancelled"})
+            self._emit_review_complete(
+                job.owner, {**base, "available": True, "status": "cancelled"}
+            )
             return
         except chess.engine.EngineError:
             raise
         except Exception as exc:  # malformed line / engine failure inside a search
             logger.exception("Game review failed")
             self._emit_review_complete(
-                {**base, "available": False, "status": "failed", "error": str(exc)}
+                job.owner,
+                {**base, "available": False, "status": "failed", "error": str(exc)},
             )
             return
 
         if not self._job_is_current(job):
-            self._emit_review_complete({**base, "available": True, "status": "cancelled"})
+            self._emit_review_complete(
+                job.owner, {**base, "available": True, "status": "cancelled"}
+            )
             return
         report["run_id"] = run_id
-        self._emit_review_complete(report)
+        self._emit_review_complete(job.owner, report)
 
     # -- payloads --------------------------------------------------------
     def _decorate(self, payload: Mapping[str, Any], token: EngineToken) -> dict[str, Any]:
@@ -1684,18 +1691,20 @@ class StockfishManager:
         )
         return decorated
 
-    def _route(self, game_id: str | None, name: str) -> Callable[..., Any] | None:
-        """The per-game listener's callback, else the process-wide default."""
+    def _route(self, owner: str | None, name: str) -> Callable[..., Any] | None:
+        """The coordinator listener's callback, else the process-wide default."""
 
-        listener = self._listener_for(game_id)
+        listener = self._listener_for(owner)
         if listener is not None:
             callback = getattr(listener, name, None)
             if callback is not None:
                 return callback
         return getattr(self, name, None)
 
-    def _emit_analysis(self, token: EngineToken, payload: dict[str, Any]) -> None:
-        callback = self._route(token.game_id, "_on_analysis")
+    def _emit_analysis(
+        self, owner: str, token: EngineToken, payload: dict[str, Any]
+    ) -> None:
+        callback = self._route(owner, "_on_analysis")
         if callback is None:
             return
         try:
@@ -1703,8 +1712,10 @@ class StockfishManager:
         except Exception:  # pragma: no cover - callback isolation
             logger.exception("Analysis callback failed")
 
-    def _emit_bot_move(self, token: EngineToken, move: str, payload: dict[str, Any]) -> None:
-        callback = self._route(token.game_id, "_on_bot_move")
+    def _emit_bot_move(
+        self, owner: str, token: EngineToken, move: str, payload: dict[str, Any]
+    ) -> None:
+        callback = self._route(owner, "_on_bot_move")
         if callback is None:
             return
         try:
@@ -1726,8 +1737,8 @@ class StockfishManager:
             except Exception:  # pragma: no cover - callback isolation
                 logger.exception("Engine error callback failed")
 
-    def _emit_review_progress(self, payload: dict[str, Any]) -> None:
-        callback = self._route(payload.get("game_id"), "_on_review_progress")
+    def _emit_review_progress(self, owner: str, payload: dict[str, Any]) -> None:
+        callback = self._route(owner, "_on_review_progress")
         if callback is None:
             return
         try:
@@ -1735,8 +1746,8 @@ class StockfishManager:
         except Exception:  # pragma: no cover - callback isolation
             logger.exception("Review progress callback failed")
 
-    def _emit_review_complete(self, payload: dict[str, Any]) -> None:
-        callback = self._route(payload.get("game_id"), "_on_review_complete")
+    def _emit_review_complete(self, owner: str, payload: dict[str, Any]) -> None:
+        callback = self._route(owner, "_on_review_complete")
         if callback is None:
             return
         try:

@@ -21,6 +21,7 @@ from collections import OrderedDict
 from typing import Any, Callable
 
 from chess_master.bridge.api import ChessMasterApi
+from chess_master.bridge.rooms import RoomManager
 from chess_master.engine.stockfish import StockfishManager
 from chess_master.storage.db import GameStore
 
@@ -71,6 +72,7 @@ class SessionManager:
         max_sessions: int = DEFAULT_MAX_SESSIONS,
         idle_ttl: float = DEFAULT_IDLE_TTL,
         clock: Callable[[], float] = time.monotonic,
+        rooms: RoomManager | None = None,
     ) -> None:
         if worker is None and template_api is not None:
             worker = template_api.worker
@@ -78,6 +80,7 @@ class SessionManager:
             store = template_api.store
         self._owns_worker = worker is None
         self._owns_store = store is None
+        self._rooms = rooms if rooms is not None else RoomManager()
         self._engine_path = engine_path
         self._worker: StockfishManager | None = worker
         self._store: GameStore = store if store is not None else GameStore(db_path)
@@ -142,6 +145,7 @@ class SessionManager:
             worker=self._worker,
             store=self._store,
             client_id=client_id,
+            rooms=self._rooms,
         )
 
     def _evict(self, now: float) -> None:

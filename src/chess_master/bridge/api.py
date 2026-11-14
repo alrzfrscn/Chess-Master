@@ -26,6 +26,7 @@ from chess_master import __version__
 from chess_master.analysis.openings import get_default_book
 from chess_master.analysis.review import CONFIRM_DEPTH_CAP, REVIEW_PRESETS
 from chess_master.analysis.winprob import model_info
+from chess_master.bridge.rooms import Room, RoomManager
 from chess_master.engine.clock import TIME_CONTROL_PRESETS
 from chess_master.engine.coordinator import EngineCoordinator
 from chess_master.engine.errors import ChessMasterError, InvalidInputError, InvalidModeError
@@ -71,6 +72,7 @@ class ChessMasterApi:
         db_path: str | Path | None = None,
         store: GameStore | None = None,
         client_id: str = "local",
+        rooms: RoomManager | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self._session = GameSession.new_game("pass_play")
@@ -82,6 +84,8 @@ class ChessMasterApi:
         self._owns_store = store is None
         self._store = store if store is not None else GameStore(db_path)
         self._client_id = str(client_id or "local")
+        self._rooms = rooms if rooms is not None else RoomManager()
+        self._room_id: str | None = None
         self._saved_reviews: set[str] = set()
         self._saved_terminals: set[tuple[str, int, str]] = set()
 
@@ -114,7 +118,12 @@ class ChessMasterApi:
     def _execute(self, operation: Callable[[], Any]) -> dict[str, Any]:
         try:
             with self._lock:
-                return self._ok(operation())
+                room = self._room()
+                if room is None:
+                    return self._ok(operation())
+                # Two tabs share one room session: serialise every room call.
+                with self._rooms.lock:
+                    return self._ok(operation())
         except ChessMasterError as exc:
             logger.info("API rejected request: %s (%s)", exc.message, exc.code)
             return self._error(exc)
@@ -129,32 +138,64 @@ class ChessMasterApi:
                 },
             }
 
+    # -- rooms and fair play --------------------------------------------
+    def _room(self) -> Room | None:
+        return self._rooms.get_room(self._room_id)
+
+    def _require_room(self) -> Room:
+        room = self._room()
+        if room is None:
+            raise InvalidInputError("Create or join an online room first.")
+        return room
+
+    def _seat(self, room: Room | None = None) -> str | None:
+        room = room if room is not None else self._room()
+        return room.seat_for(self._client_id) if room is not None else None
+
+    def _fair_play(self) -> bool:
+        room = self._room()
+        return bool(room is not None and room.status != "finished")
+
+    def _leave_room(self) -> None:
+        self._room_id = None
+
     # -- engine orchestration -------------------------------------------
     def _sync_engine(self) -> None:
+        fair_play = self._fair_play()
         wants_analysis = bool(
             self._polling_started
             and (self._analysis_options["enabled"] or self._analysis_options["arrows"])
+            and not fair_play
         )
         self._engine.sync(
             self._session,
             analysis_enabled=wants_analysis,
-            arrows=bool(self._analysis_options["arrows"]),
+            arrows=bool(self._analysis_options["arrows"]) and not fair_play,
             depth=int(self._analysis_options["depth"]),
             multipv=int(self._analysis_options["multipv"]),
         )
 
     def _compose_state(self) -> dict[str, Any]:
+        fair_play = self._fair_play()
         state = self._session.to_state()
         state["engine"] = self._engine.engine_payload(self._session)
         state["engine"]["analysis"] = dict(self._analysis_options)
         state["engine"]["analysis"]["enabled"] = bool(
             self._polling_started
             and (self._analysis_options["enabled"] or self._analysis_options["arrows"])
+            and not fair_play
         )
         state["evaluation"] = self._engine.evaluation(self._session)
-        state["evaluation"]["bars"] = bool(self._analysis_options["enabled"])
-        state["evaluation"]["arrows"] = bool(self._analysis_options["arrows"])
+        state["evaluation"]["bars"] = bool(self._analysis_options["enabled"]) and not fair_play
+        state["evaluation"]["arrows"] = bool(self._analysis_options["arrows"]) and not fair_play
+        if fair_play:
+            state["evaluation"]["enabled"] = False
+            state["evaluation"]["arrows"] = False
         state["review"] = self._engine.game_review()
+        room = self._room()
+        state["room"] = room.to_state(self._client_id) if room is not None else None
+        if room is not None and room.seat_for(self._client_id):
+            state["orientation"] = room.seat_for(self._client_id)
         return state
 
     def _bind_session(self, session: GameSession) -> None:
@@ -244,6 +285,7 @@ class ChessMasterApi:
                 raise InvalidInputError("Game mode must be text.")
             session = GameSession.new_game(mode, options)
             self._archive_before_replacing()
+            self._leave_room()
             self._bind_session(session)
             return self._compose_state()
 
@@ -253,7 +295,12 @@ class ChessMasterApi:
         """Return the current game to its root position and discard moves."""
 
         def operation() -> dict[str, Any]:
+            if self._room() is not None:
+                raise InvalidInputError(
+                    "Leave the online room before starting a new game.",
+                )
             self._archive_before_replacing()
+            self._leave_room()
             self._session.reset()
             self._sync_engine()
             return self._compose_state()
@@ -268,6 +315,7 @@ class ChessMasterApi:
                 raise InvalidInputError("A PGN must be provided as text.")
             session = GameSession.from_pgn(pgn_str)
             self._archive_before_replacing()
+            self._leave_room()
             self._bind_session(session)
             self._archive_current(force=True)
             return self._compose_state()
@@ -282,6 +330,7 @@ class ChessMasterApi:
                 raise InvalidInputError("A FEN must be provided as text.")
             session = GameSession.from_fen(fen_str, options)
             self._archive_before_replacing()
+            self._leave_room()
             self._bind_session(session)
             return self._compose_state()
 
@@ -317,9 +366,97 @@ class ChessMasterApi:
             incoming["start_fen"] = drill["fen"]
             session = GameSession.new_game(mode, incoming)
             self._archive_before_replacing()
+            self._leave_room()
             self._bind_session(session)
             state = self._compose_state()
             state["drill"] = drill
+            return state
+
+        return self._execute(operation)
+
+    # -- online rooms ----------------------------------------------------
+    def create_room(self, options: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Open a shareable online room; the creator hosts the white seat."""
+
+        def operation() -> dict[str, Any]:
+            self._archive_before_replacing()
+            room = self._rooms.create_room(self._client_id, options)
+            self._room_id = room.room_id
+            with self._rooms.lock:
+                self._bind_session(room.session)
+                return self._compose_state()
+
+        return self._execute(operation)
+
+    def join_room(self, room_id: str) -> dict[str, Any]:
+        """Join a room by code: the second client takes black, others spectate."""
+
+        def operation() -> dict[str, Any]:
+            room = self._rooms.join_room(room_id, self._client_id)
+            if room.room_id != self._room_id:
+                self._archive_before_replacing()
+            self._room_id = room.room_id
+            with self._rooms.lock:
+                self._bind_session(room.session)
+                return self._compose_state()
+
+        return self._execute(operation)
+
+    def rematch_room(self) -> dict[str, Any]:
+        """Start a rematch on the same table, swapping the players' colors."""
+
+        def operation() -> dict[str, Any]:
+            room = self._require_room()
+            self._archive_current(force=True)
+            self._rooms.rematch(room, self._client_id)
+            self._bind_session(room.session)
+            return self._compose_state()
+
+        return self._execute(operation)
+
+    def resign_game(self) -> dict[str, Any]:
+        """Resign for your seat (or the side on move in a local game)."""
+
+        def operation() -> dict[str, Any]:
+            room = self._room()
+            seat = self._seat(room)
+            if room is not None:
+                if room.status == "waiting":
+                    raise InvalidInputError("The game has not started yet.")
+                if seat is None:
+                    raise InvalidInputError("Spectators cannot resign.")
+            self._session.resign(seat)
+            self._sync_engine()
+            state = self._compose_state()
+            self._archive_terminal(state)
+            return state
+
+        return self._execute(operation)
+
+    def offer_or_accept_draw(self, action: str = "offer") -> dict[str, Any]:
+        """Offer a draw, or accept/decline the pending offer."""
+
+        def operation() -> dict[str, Any]:
+            if not isinstance(action, str) or action.strip().lower() not in (
+                "offer",
+                "accept",
+                "decline",
+            ):
+                raise InvalidInputError(
+                    "Draw action must be offer, accept or decline.",
+                    details={"action": action},
+                )
+            choice = action.strip().lower()
+            seat = self._seat()
+            if self._room() is not None and seat is None:
+                raise InvalidInputError("Spectators cannot offer or answer a draw.")
+            if choice == "offer":
+                self._session.offer_draw(seat)
+            else:
+                self._session.respond_draw(choice == "accept", seat)
+            self._sync_engine()
+            state = self._compose_state()
+            self._archive_terminal(state)
             return state
 
         return self._execute(operation)
@@ -328,8 +465,19 @@ class ChessMasterApi:
         """Play a move in UCI (``e2e4``) or SAN (``Nf3``) notation."""
 
         def operation() -> dict[str, Any]:
+            room = self._room()
+            if room is not None:
+                if room.status == "waiting":
+                    raise InvalidInputError("Wait for an opponent to join the room.")
+                seat = self._seat(room)
+                if seat is None:
+                    raise InvalidInputError("Spectators cannot move pieces.")
+                if seat != self._session.turn:
+                    raise InvalidInputError("It is not your turn.")
             self._session.make_move(move)
             self._sync_engine()
+            if room is not None:
+                self._rooms.touch(room)
             state = self._compose_state()
             self._archive_terminal(state)
             return state
@@ -340,6 +488,10 @@ class ChessMasterApi:
         """Move the read-only view cursor; never mutates the game line."""
 
         def operation() -> dict[str, Any]:
+            if self._fair_play():
+                raise InvalidInputError(
+                    "Step through the game after it finishes; the live room is fair play only.",
+                )
             self._session.navigate_ply(ply_index)
             self._sync_engine()
             return self._compose_state()
@@ -493,6 +645,10 @@ class ChessMasterApi:
         """
 
         def operation() -> dict[str, Any]:
+            if self._fair_play():
+                raise InvalidInputError(
+                    "Game Review unlocks when the online game is over.",
+                )
             if not isinstance(preset, str) or preset.strip().lower() not in REVIEW_PRESETS:
                 raise InvalidInputError(
                     "Choose a review preset: fast, standard or deep.",
@@ -749,6 +905,11 @@ class ChessMasterApi:
                     "export_archive_pgn",
                     "get_opening_explorer",
                     "search_openings",
+                    "create_room",
+                    "join_room",
+                    "rematch_room",
+                    "resign_game",
+                    "offer_or_accept_draw",
                 ],
                 "capabilities": {
                     "pass_and_play": True,
@@ -774,6 +935,10 @@ class ChessMasterApi:
                     "review_export": True,
                     "board_editor": True,
                     "drills": True,
+                    "online_rooms": True,
+                    "resign": True,
+                    "draw_offers": True,
+                    "rematch": True,
                 },
                 "archive": {"db_info": self._store.db_info()},
                 "analysis": model_info(),

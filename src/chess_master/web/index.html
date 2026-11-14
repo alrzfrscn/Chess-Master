@@ -206,6 +206,18 @@
               </span>
               <span class="nav-tail"><span class="nav-badge nav-badge-live">Ready</span></span>
             </button>
+            <button
+              type="button"
+              class="nav-item"
+              data-mode="online"
+            >
+              <span class="nav-icon"><svg class="icon"><use href="#i-users" /></svg></span>
+              <span class="nav-copy">
+                <span class="nav-label">Play a Friend</span>
+                <span class="nav-sub">Online room, shared link</span>
+              </span>
+              <span class="nav-tail"><span class="nav-badge">Live</span></span>
+            </button>
           </section>
 
           <section class="nav-section">
@@ -293,6 +305,40 @@
         </header>
 
         <section class="board-column" aria-label="Chess table">
+          <div class="room-banner" id="room-banner" hidden>
+            <div class="room-banner-main">
+              <span class="room-code-chip">Room <strong id="room-code">—</strong></span>
+              <span class="room-status" id="room-status">Waiting for a friend…</span>
+              <span class="panel-chip" id="room-seat">Spectator</span>
+            </div>
+            <div class="room-banner-actions">
+              <input
+                id="room-invite"
+                class="input room-invite-input"
+                type="text"
+                readonly
+                spellcheck="false"
+                aria-label="Room invite link"
+              />
+              <button type="button" class="btn btn-quiet btn-compact" id="btn-copy-room">
+                <svg class="icon"><use href="#i-copy" /></svg>
+                <span>Copy link</span>
+              </button>
+              <button type="button" class="btn btn-primary btn-compact" id="btn-rematch-room" hidden>
+                <svg class="icon"><use href="#i-reset" /></svg>
+                <span>Rematch</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="draw-banner" id="draw-banner" hidden>
+            <span class="draw-banner-text" id="draw-banner-text">Your opponent offers a draw.</span>
+            <div class="draw-banner-actions">
+              <button type="button" class="btn btn-primary btn-compact" id="btn-accept-draw">Accept</button>
+              <button type="button" class="btn btn-quiet btn-compact" id="btn-decline-draw">Decline</button>
+            </div>
+          </div>
+
           <div class="player-banner" id="player-top" data-color="black">
             <div class="player-identity">
               <div class="avatar" data-avatar>
@@ -398,6 +444,14 @@
               <button type="button" class="tool-btn" data-action="reset" title="Reset this game">
                 <svg class="icon"><use href="#i-reset" /></svg>
                 <span>Reset</span>
+              </button>
+              <button type="button" class="tool-btn" data-action="draw" title="Offer a draw" hidden>
+                <svg class="icon"><use href="#i-users" /></svg>
+                <span>Draw</span>
+              </button>
+              <button type="button" class="tool-btn" data-action="resign" title="Resign the game" hidden>
+                <svg class="icon"><use href="#i-x" /></svg>
+                <span>Resign</span>
               </button>
               <span class="tool-divider"></span>
               <button type="button" class="tool-btn" data-action="eval" aria-pressed="true" title="Toggle evaluation bar (E)">
@@ -1183,6 +1237,14 @@
             </span>
             <span class="mode-check"><svg class="icon"><use href="#i-check" /></svg></span>
           </button>
+          <button type="button" class="mode-option" data-new-mode="online" aria-pressed="false">
+            <span class="mode-icon"><svg class="icon"><use href="#i-users" /></svg></span>
+            <span class="mode-option-copy">
+              <span class="mode-option-title">Play a Friend</span>
+              <span class="mode-option-sub">Online room · shared link</span>
+            </span>
+            <span class="mode-check"><svg class="icon"><use href="#i-check" /></svg></span>
+          </button>
         </div>
 
         <div class="field-grid" id="new-pass-fields">
@@ -1256,6 +1318,31 @@
             <svg class="icon"><use href="#i-alert" /></svg>
             <span>Stockfish is not available yet. Start the table, then use Engine setup to point Chess Master at a binary.</span>
           </p>
+        </div>
+
+        <div class="online-fields" id="new-online-fields" hidden>
+          <p class="dialog-note online-note">
+            Create a room and share the invite link. Your friend joins as Black; you host White.
+            Engine evaluation and Game Review stay locked while the game is live.
+          </p>
+          <label class="field">
+            <span class="field-label">Have a room code?</span>
+            <input
+              id="new-room-code"
+              class="input"
+              type="text"
+              maxlength="8"
+              placeholder="e.g. k7m2pqrs"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </label>
+          <div class="dialog-actions dialog-actions-split">
+            <button type="button" class="btn btn-quiet btn-compact" id="btn-join-room">
+              <svg class="icon"><use href="#i-arrow-up-right" /></svg>
+              <span>Join room</span>
+            </button>
+          </div>
         </div>
 
         <div class="time-control-block">

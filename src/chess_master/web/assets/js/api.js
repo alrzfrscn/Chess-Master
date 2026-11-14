@@ -252,11 +252,25 @@ export function requestedGameId() {
   return new URLSearchParams(window.location.search).get("game");
 }
 
+/** The room code a shared invite link pointed at, if any. */
+export function requestedRoomId() {
+  return new URLSearchParams(window.location.search).get("room");
+}
+
 /** Absolute share URL for an archived game, on whatever origin serves the page. */
 export function shareGameUrl(gameId) {
   const url = new URL(window.location.href);
   url.search = "";
   url.hash = "";
   url.searchParams.set("game", String(gameId));
+  return url.toString();
+}
+
+/** Absolute invite URL for an online room. */
+export function shareRoomUrl(roomId) {
+  const url = new URL(window.location.href);
+  url.search = "";
+  url.hash = "";
+  url.searchParams.set("room", String(roomId));
   return url.toString();
 }

@@ -12,10 +12,12 @@ the API lock, after checking the token one final time.
 from __future__ import annotations
 
 import copy
+import inspect
 import logging
 import random
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -93,6 +95,10 @@ class EngineCoordinator:
     ) -> None:
         self._lock = threading.RLock()
         self._worker = worker or StockfishManager(path=path, project_root=project_root)
+        # Every coordinator owns a distinct slice of the shared worker's jobs,
+        # tokens and listeners, so two tabs can analyse or play at once.
+        self._owner_id = uuid.uuid4().hex
+        self._owner_support: dict[str, bool] = {}
         self._worker.set_callbacks(
             on_analysis=self._on_analysis,
             on_bot_move=self._on_bot_move,
@@ -100,8 +106,8 @@ class EngineCoordinator:
             on_review_complete=self._on_review_complete,
             on_error=self._on_error,
         )
+        self._register_listener()
         self._token: EngineToken | None = None
-        self._listener_game_id: str | None = None
         self._analysis: dict[str, Any] | None = None
         self._pending_bot: dict[str, Any] | None = None
         self._bot_scheduled: EngineToken | None = None
@@ -124,6 +130,10 @@ class EngineCoordinator:
     @property
     def worker(self) -> StockfishManager:
         return self._worker
+
+    @property
+    def owner_id(self) -> str:
+        return self._owner_id
 
     @property
     def options(self) -> dict[str, Any]:
@@ -150,11 +160,10 @@ class EngineCoordinator:
 
     def bind(self, session: "GameSession") -> EngineToken:
         token = self.token_for(session)
-        self._register_listener(token.game_id)
         with self._lock:
             self._reset_review()
             self._reset_for(token)
-        self._worker.set_active_token(token)
+        self._call_worker("set_active_token", token)
         return token
 
     def sync(
@@ -169,7 +178,6 @@ class EngineCoordinator:
         """Re-point the engine at the session's current revision and schedule."""
 
         token = self.token_for(session)
-        self._register_listener(token.game_id)
         self._invalidate_review_if_needed(session)
         self._apply_sync_options(
             analysis_enabled=analysis_enabled,
@@ -178,7 +186,7 @@ class EngineCoordinator:
             multipv=multipv,
         )
         self._apply_sync_token(token)
-        self._worker.set_active_token(token)
+        self._call_worker("set_active_token", token)
         if self._review_is_running():
             if self._is_bot_turn(session):
                 # The bot must keep playing; a review is a background task.
@@ -238,7 +246,7 @@ class EngineCoordinator:
             depth = int(options["depth"])
             multipv = int(options["multipv"])
         if reset:
-            self._worker.set_active_token(token)
+            self._call_worker("set_active_token", token)
 
         if not self._worker.available:
             return
@@ -262,7 +270,8 @@ class EngineCoordinator:
                     and self._token == token
                 )
             if should_submit:
-                status = self._worker.submit_bot(
+                status = self._call_worker(
+                    "submit_bot",
                     token,
                     start_fen=session.start_fen,
                     moves=session.move_ucis(session.view_ply),
@@ -284,7 +293,8 @@ class EngineCoordinator:
                     and self._token == token
                 )
             if need_analysis:
-                status = self._worker.submit_analysis(
+                status = self._call_worker(
+                    "submit_analysis",
                     token,
                     start_fen=session.start_fen,
                     moves=session.move_ucis(session.view_ply),
@@ -481,9 +491,10 @@ class EngineCoordinator:
             baseline_white=baseline_white,
             baseline_black=baseline_black,
             use_book=bool(use_book),
+            owner=self._owner_id,
         )
 
-        self._worker.cancel_review()
+        self._call_worker("cancel_review")
         with self._lock:
             self._reset_review()
             self._review_signature = signature
@@ -511,7 +522,7 @@ class EngineCoordinator:
             }
 
         status = self._worker.submit_review(request)
-        run_id = self._worker.review_run_id
+        run_id = self._call_worker("review_run_id")
         with self._lock:
             if self._review is None:
                 return self.review_payload()
@@ -543,7 +554,7 @@ class EngineCoordinator:
             signature = line_signature(session.game_id, session.start_fen, session.move_ucis())
         else:
             signature = self._review_signature
-        self._worker.cancel_review()
+        self._call_worker("cancel_review")
         with self._lock:
             if (
                 self._review is not None
@@ -675,7 +686,7 @@ class EngineCoordinator:
         signature = line_signature(session.game_id, session.start_fen, session.move_ucis())
         if signature == self._review_signature:
             return
-        self._worker.cancel_review()
+        self._call_worker("cancel_review")
         with self._lock:
             if signature != self._review_signature:
                 self._reset_review()
@@ -774,7 +785,7 @@ class EngineCoordinator:
         status = self._worker.configure_path(path)
         token = self._token
         if token is not None:
-            self._worker.set_active_token(token)
+            self._call_worker("set_active_token", token)
         return status
 
     def shutdown(self) -> None:
@@ -784,27 +795,42 @@ class EngineCoordinator:
             self._review = None
             self._review_report = None
         self.detach()
-        self._worker.cancel_review()
+        self._call_worker("cancel_review")
         self._worker.stop()
 
     def detach(self) -> None:
         """Stop listening to a shared worker without stopping it."""
 
-        release = getattr(self._worker, "release_game", None)
-        if release is not None and self._listener_game_id is not None:
-            release(self._listener_game_id)
-        self._listener_game_id = None
+        release = getattr(self._worker, "release_owner", None)
+        if release is not None:
+            release(self._owner_id)
 
-    def _register_listener(self, game_id: str) -> None:
-        """Bind this coordinator to a shared worker's callbacks for one game."""
+    def _register_listener(self) -> None:
+        """Bind this coordinator to a shared worker's callbacks."""
 
         register = getattr(self._worker, "set_listener", None)
         if register is None:
             return
-        if self._listener_game_id not in (None, game_id):
-            self.detach()
-        self._listener_game_id = game_id
-        register(game_id, self)
+        register(self._owner_id, self)
+
+    def _call_worker(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        """Call the shared worker, passing this coordinator's owner when supported.
+
+        A test double or an older worker without owner-aware methods keeps the
+        single-session behaviour.
+        """
+
+        method = getattr(self._worker, name)
+        supports = self._owner_support.get(name)
+        if supports is None:
+            try:
+                supports = "owner" in inspect.signature(method).parameters
+            except (TypeError, ValueError):
+                supports = False
+            self._owner_support[name] = supports
+        if supports:
+            kwargs["owner"] = self._owner_id
+        return method(*args, **kwargs)
 
     # -- worker callbacks ------------------------------------------------
     def _on_analysis(self, token: EngineToken, payload: dict[str, Any]) -> None:
@@ -847,7 +873,7 @@ class EngineCoordinator:
                 )
                 cancel_review = True
         if cancel_review:
-            self._worker.cancel_review()
+            self._call_worker("cancel_review")
 
     def _on_review_progress(self, payload: dict[str, Any]) -> None:
         self._apply_review_progress(payload)

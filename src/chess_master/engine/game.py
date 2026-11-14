@@ -40,7 +40,7 @@ __all__ = [
     "bot_pace_for_time_control",
 ]
 
-VALID_MODES = ("pass_play", "stockfish")
+VALID_MODES = ("pass_play", "stockfish", "online")
 MIN_BOT_ELO = 400
 MAX_BOT_ELO = 3000
 DEFAULT_BOT_ELO = 1400
@@ -238,6 +238,9 @@ class GameSession:
             )
         self._clock = clock
         self._timeout: dict[str, Any] | None = dict(timeout) if timeout else None
+        self._resigned_by: str | None = None
+        self._draw_agreed = False
+        self._draw_offer_by: str | None = None
         self._engine_player_color: str | None = None
         self._engine_bot_color: str | None = None
         self._engine_bot_elo: int | None = None
@@ -310,11 +313,11 @@ class GameSession:
         )
 
         today = datetime.now(timezone.utc).strftime("%Y.%m.%d")
-        default_event = (
-            "Chess Master - Pass & Play"
-            if mode == "pass_play"
-            else "Chess Master - Play vs Stockfish"
-        )
+        default_event = {
+            "pass_play": "Chess Master - Pass & Play",
+            "stockfish": "Chess Master - Play vs Stockfish",
+            "online": "Chess Master - Online Room",
+        }[mode]
         headers = {
             "Event": _clean_name(options.get("event_name"), default_event),
             "Site": "Chess Master",
@@ -510,6 +513,13 @@ class GameSession:
         except InvalidInputError:
             pace = DEFAULT_BOT_PACE
         session._engine_bot_pace = pace if mode == "stockfish" else DEFAULT_BOT_PACE
+        termination = str(record.get("termination_state") or "")
+        if termination == "resigned":
+            winner = record.get("winner")
+            if winner in ("white", "black"):
+                session._resigned_by = _opposite(str(winner))
+        elif termination == "draw" and str(record.get("termination_reason") or "") == "agreement":
+            session._draw_agreed = True
         return session
 
     # ------------------------------------------------------------------
@@ -544,6 +554,10 @@ class GameSession:
         return self._engine_bot_pace or DEFAULT_BOT_PACE
 
     @property
+    def turn(self) -> str:
+        return "white" if self._board.turn == chess.WHITE else "black"
+
+    @property
     def total_plies(self) -> int:
         return len(self._moves)
 
@@ -573,7 +587,15 @@ class GameSession:
         self._sync_clock()
         if self._timeout is not None:
             return dict(self._timeout)
-        return position_status(self._board)
+        status = position_status(
+            self._board,
+            resigned_by=self._resigned_by,
+            draw_agreed=self._draw_agreed,
+        )
+        status["draw_offer_by"] = (
+            self._draw_offer_by if status["state"] == "in_progress" else None
+        )
+        return status
 
     def _sync_clock(self) -> None:
         if self._clock is None or self._timeout is not None or not self._clock.running:
@@ -647,6 +669,7 @@ class GameSession:
             )
 
         move = self._parse_move(move_input)
+        self._draw_offer_by = None
         board = self._board
         fen_before = board.fen()
         color = "white" if board.turn == chess.WHITE else "black"
@@ -683,6 +706,90 @@ class GameSession:
         self._headers["Result"] = status["result"] if status["state"] != "in_progress" else "*"
         return self.to_state()
 
+    def resign(self, color: str | None = None) -> dict[str, Any]:
+        """End the game by resignation; ``None`` resigns for the side on move."""
+
+        status = self.status()
+        if status["state"] != "in_progress":
+            raise GameOverError(
+                "The game is already over in this position.",
+                details={"state": status["state"], "reason": status["reason"]},
+            )
+        self._resigned_by = self._resolve_color(color)
+        self._draw_offer_by = None
+        if self._clock is not None:
+            self._clock.stop()
+        status = self.status()
+        self._headers["Result"] = status["result"]
+        self.revision += 1
+        return self.to_state()
+
+    def offer_draw(self, color: str | None = None) -> dict[str, Any]:
+        """Record a draw offer; a move or a decline clears it again."""
+
+        status = self.status()
+        if status["state"] != "in_progress":
+            raise GameOverError(
+                "The game is already over in this position.",
+                details={"state": status["state"], "reason": status["reason"]},
+            )
+        self._draw_offer_by = self._resolve_color(color)
+        self.revision += 1
+        return self.to_state()
+
+    def respond_draw(self, accept: bool, color: str | None = None) -> dict[str, Any]:
+        """Accept or decline the pending offer. ``None`` is the offering side's opponent."""
+
+        status = self.status()
+        if status["state"] != "in_progress":
+            raise GameOverError(
+                "The game is already over in this position.",
+                details={"state": status["state"], "reason": status["reason"]},
+            )
+        offer = self._draw_offer_by
+        if offer is None:
+            raise InvalidInputError("There is no draw offer to answer.")
+        responder = self._resolve_color(color) if color is not None else _opposite(offer)
+        if responder == offer:
+            raise InvalidInputError("You cannot answer your own draw offer.")
+        self._draw_offer_by = None
+        if accept:
+            self._draw_agreed = True
+            if self._clock is not None:
+                self._clock.stop()
+        status = self.status()
+        self._headers["Result"] = (
+            status["result"] if status["state"] != "in_progress" else "*"
+        )
+        self.revision += 1
+        return self.to_state()
+
+    def rematch_swap(self) -> dict[str, Any]:
+        """Start a fresh game on the same table with the colors swapped."""
+
+        self.reset()
+        white, black = self._players["white"], self._players["black"]
+        self._players = {
+            "white": _player("white", black.name),
+            "black": _player("black", white.name),
+        }
+        self._headers["White"] = self._players["white"].name
+        self._headers["Black"] = self._players["black"].name
+        self._game_id = uuid.uuid4().hex[:12]
+        self._created_at = _utc_now()
+        return self.to_state()
+
+    def _resolve_color(self, color: str | None) -> str:
+        if color is None:
+            return "white" if self._board.turn == chess.WHITE else "black"
+        text = str(color).strip().lower()
+        if text not in ("white", "black"):
+            raise InvalidInputError(
+                "Player color must be white or black.",
+                details={"color": color},
+            )
+        return text
+
     def reset(self) -> dict[str, Any]:
         self._board = self._root_board.copy()
         self._moves.clear()
@@ -696,6 +803,9 @@ class GameSession:
                 active_color="white" if self._root_board.turn == chess.WHITE else "black",
             )
         self._timeout = None
+        self._resigned_by = None
+        self._draw_agreed = False
+        self._draw_offer_by = None
         self.revision += 1
         return self.to_state()
 
@@ -809,7 +919,7 @@ class GameSession:
             "headers": dict(self._headers),
             "event": self._headers.get("Event") or self._mode_label(),
             "players": {color: player.to_dict() for color, player in self._players.items()},
-            "turn": "white" if self._board.turn == chess.WHITE else "black",
+            "turn": self.turn,
             "orientation": self._engine_player_color or "white",
             "ply": self._view_ply,
             "total_plies": len(self._moves),
@@ -894,6 +1004,7 @@ class GameSession:
         return {
             "pass_play": "Pass & Play",
             "stockfish": "Play vs Stockfish",
+            "online": "Online Room",
             "import": "Imported game",
         }.get(self.mode, self.mode)
 

@@ -118,6 +118,7 @@ class ReviewRequest:
     baseline_white: int | None = None
     baseline_black: int | None = None
     use_book: bool = True
+    owner: str = "local"
 
     def __post_init__(self) -> None:
         if self.preset not in REVIEW_PRESETS:

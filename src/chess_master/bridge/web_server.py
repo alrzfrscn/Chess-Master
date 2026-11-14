@@ -408,13 +408,23 @@ def _state_fingerprint(api: ChessMasterApi) -> dict[str, Any]:
     evaluation = state.get("evaluation") or {}
     review = state.get("review") or {}
     progress = review.get("progress") or {}
+    room = state.get("room") or {}
+    status = state.get("status") or {}
     return {
         "ok": True,
         "game_id": state.get("game_id"),
         "revision": state.get("revision"),
         "ply": state.get("ply"),
         "total_plies": state.get("total_plies"),
-        "status": (state.get("status") or {}).get("state"),
+        "status": status.get("state"),
+        "turn": state.get("turn"),
+        "draw_offer_by": status.get("draw_offer_by"),
+        "room_id": room.get("room_id"),
+        "room_status": room.get("status"),
+        "seat": room.get("seat"),
+        "seats": room.get("seats"),
+        "fair_play": room.get("fair_play"),
+        "rematch_available": room.get("rematch_available"),
         "thinking": bool(engine.get("thinking")),
         "engine_status": engine.get("status"),
         "evaluation_updated_at": evaluation.get("updated_at"),

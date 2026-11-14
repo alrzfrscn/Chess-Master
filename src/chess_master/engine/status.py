@@ -11,8 +11,37 @@ __all__ = ["position_status", "result_from_status"]
 _RESULT_BY_WINNER = {"white": "1-0", "black": "0-1"}
 
 
-def position_status(board: chess.Board) -> dict[str, Any]:
-    """Describe check, checkmate, stalemate and automatic draw states."""
+def _terminal(
+    state: str,
+    reason: str,
+    winner: str | None,
+    *,
+    check: bool = False,
+    check_square: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "state": state,
+        "reason": reason,
+        "winner": winner,
+        "result": _RESULT_BY_WINNER.get(winner or "", "1/2-1/2"),
+        "check": check,
+        "check_square": check_square,
+        "claimable_draw": None,
+    }
+
+
+def position_status(
+    board: chess.Board,
+    *,
+    resigned_by: str | None = None,
+    draw_agreed: bool = False,
+) -> dict[str, Any]:
+    """Describe check, checkmate, stalemate and explicit player endings.
+
+    ``resigned_by`` and ``draw_agreed`` come from a live table: they take
+    precedence over the board because the game ended by player action, not by
+    the position on the board.
+    """
 
     check = board.is_check()
     check_square = None
@@ -20,6 +49,14 @@ def position_status(board: chess.Board) -> dict[str, Any]:
         king_square = board.king(board.turn)
         if king_square is not None:
             check_square = chess.square_name(king_square)
+
+    if resigned_by in ("white", "black"):
+        winner = "black" if resigned_by == "white" else "white"
+        return _terminal(
+            "resigned", "resignation", winner, check=check, check_square=check_square
+        )
+    if draw_agreed:
+        return _terminal("draw", "agreement", None)
 
     claimable_draw = None
     if board.is_fifty_moves():
@@ -42,15 +79,9 @@ def position_status(board: chess.Board) -> dict[str, Any]:
     termination = outcome.termination
     if termination == chess.Termination.CHECKMATE:
         winner = "white" if outcome.winner == chess.WHITE else "black"
-        return {
-            "state": "checkmate",
-            "reason": "checkmate",
-            "winner": winner,
-            "result": _RESULT_BY_WINNER[winner],
-            "check": True,
-            "check_square": check_square,
-            "claimable_draw": None,
-        }
+        return _terminal(
+            "checkmate", "checkmate", winner, check=True, check_square=check_square
+        )
 
     if termination == chess.Termination.STALEMATE:
         reason = "stalemate"
@@ -63,15 +94,7 @@ def position_status(board: chess.Board) -> dict[str, Any]:
     else:
         reason = str(termination).lower()
 
-    return {
-        "state": "draw",
-        "reason": reason,
-        "winner": None,
-        "result": "1/2-1/2",
-        "check": False,
-        "check_square": None,
-        "claimable_draw": None,
-    }
+    return _terminal("draw", reason, None)
 
 
 def result_from_status(status: dict[str, Any], fallback: str = "*") -> str:
