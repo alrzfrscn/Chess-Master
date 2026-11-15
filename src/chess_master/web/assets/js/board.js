@@ -69,6 +69,18 @@ export class BoardController {
     this.overlay.setAttribute("aria-hidden", "true");
     this.element.append(this.overlay);
 
+    const handleResize = () => {
+      if (!this.ground) return;
+      this.ground.redrawAll();
+      if (this.reviewOverlay) this.setReviewOverlay(this.reviewOverlay);
+      if (this.autoShapes.length) this.queueArrows();
+    };
+
+    if ("ResizeObserver" in window) {
+      this.resizeObserver = new ResizeObserver(handleResize);
+      this.resizeObserver.observe(this.element);
+    }
+    window.addEventListener("resize", handleResize);
   }
 
   render(game, { orientation = "white", canPlay = true, preview = null, sandbox = null } = {}) {

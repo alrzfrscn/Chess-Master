@@ -1369,8 +1369,15 @@ function startClockTicker() {
   }, 100);
 }
 
+function scrollToInspectorOnMobile() {
+  if (window.matchMedia("(max-width: 1024px)").matches) {
+    document.querySelector(".inspector")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+}
+
 function openImport() {
   tabs.setActive("import");
+  scrollToInspectorOnMobile();
   requestAnimationFrame(() => panel?.textarea?.focus());
 }
 
@@ -1650,8 +1657,12 @@ function wireShell() {
   }
 
   for (const button of document.querySelectorAll("[data-open-tab]")) {
-    button.addEventListener("click", () => tabs.setActive(button.dataset.openTab));
+    button.addEventListener("click", () => {
+      tabs.setActive(button.dataset.openTab);
+      scrollToInspectorOnMobile();
+    });
   }
+
 
   for (const button of document.querySelectorAll("[data-mode]")) {
     button.addEventListener("click", () => openNewGame(button.dataset.mode));
