@@ -22,6 +22,18 @@ files; paths are listed below. Versions reflect the current lockfiles.
 - Distributed file: `src/chess_master/web/assets/vendor/chess.js/chess.js`
 - Full license: `src/chess_master/web/assets/vendor/chess.js/LICENSE`
 
+### Stockfish.js 19.0.1 (Stockfish Lite WASM)
+
+- Copyright (c) 2026 Chess.com, LLC; Stockfish (c) T. Romstad, M. Costalba,
+  J. Kiiski, G. Linscott and other contributors; networks by Chris Bao.
+- License: GNU General Public License v3.0 (GPL-3.0).
+- Source: <https://github.com/nmrugg/stockfish.js> (npm `stockfish@19.0.1`).
+- Use: the browser engine for live analysis, bot moves and Game Review. The
+  desktop build additionally copies a native binary from `bin/` at build time.
+- Distributed files: `src/chess_master/web/assets/vendor/stockfish/stockfish-lite.js`
+  and `stockfish-lite.wasm`.
+- Full license: `src/chess_master/web/assets/vendor/stockfish/LICENSE`
+
 ### cburnett chess pieces
 
 - SVG pieces extracted from Chessground's cburnett board theme.
@@ -85,9 +97,9 @@ installed from the package index and are not vendored in this repository.
 
 ## Project licensing note
 
-The original Chess Master source is declared MIT in `pyproject.toml`. Chessground
-and python-chess are GPL-3.0-or-later. A distributed application that combines
-these components must comply with the GPL, including source and notice
+The original Chess Master source is declared MIT in `pyproject.toml`. Chessground,
+python-chess and Stockfish are GPL-3.0(-or-later). A distributed application that
+combines these components must comply with the GPL, including source and notice
 requirements. MIT is compatible with GPLv3, but the combined distribution is
 subject to GPLv3 obligations. This notice is informational and is not legal
 advice.

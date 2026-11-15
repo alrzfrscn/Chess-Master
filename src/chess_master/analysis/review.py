@@ -56,8 +56,11 @@ __all__ = [
     "ReviewCancelled",
     "ReviewRequest",
     "ReviewSearchResult",
+    "confirm_positions",
     "line_signature",
+    "review_plan",
     "run_game_review",
+    "search_results_from_payload",
 ]
 
 REVIEW_SCHEMA_VERSION = 2
@@ -429,6 +432,162 @@ def _detect_opening(
     return info, int(info.last_book_ply)
 
 
+def review_plan(request: ReviewRequest, *, opening_book: OpeningBook | None = None) -> dict[str, Any]:
+    """Describe the work a review needs, for a client-side engine.
+
+    The browser runs every position in ``needed_positions`` at ``base_depth``
+    (MultiPV 3), then the confirmation round at ``confirm_depth``.
+    """
+
+    if not isinstance(request, ReviewRequest):
+        raise TypeError("review_plan expects a ReviewRequest")
+    boards = _replay(request)
+    _opening, last_book_ply = _detect_opening(request, opening_book)
+    total_plies = len(request.moves)
+    graded = [ply for ply in range(1, total_plies + 1) if ply > last_book_ply]
+    needed = list(range(last_book_ply, total_plies + 1)) if graded else []
+    terminals = [index for index in needed if _terminal_result(boards[index]) is not None]
+    return {
+        "signature": request.signature,
+        "game_id": request.game_id,
+        "start_fen": request.start_fen,
+        "moves": list(request.moves),
+        "preset": request.preset,
+        "base_depth": request.base_depth,
+        "confirm_depth": request.confirm_depth,
+        "multipv": REVIEW_MULTIPV,
+        "last_book_ply": last_book_ply,
+        "needed_positions": needed,
+        "terminal_positions": terminals,
+        "fens": [board.fen() for board in boards],
+        "total_plies": total_plies,
+    }
+
+
+def confirm_positions(
+    request: ReviewRequest,
+    evals: Mapping[int, ReviewSearchResult],
+    *,
+    opening_book: OpeningBook | None = None,
+) -> tuple[int, list[int]]:
+    """Positions the second pass must re-search, given the first-pass evals."""
+
+    boards = _replay(request)
+    opening, last_book_ply = _detect_opening(request, opening_book)
+    records = [
+        _base_record(ply, boards, request, opening, last_book_ply)
+        for ply in range(1, len(request.moves) + 1)
+    ]
+    _classify_all(
+        records,
+        boards,
+        {index: _PositionEval(result=result) for index, result in evals.items()},
+        set(),
+    )
+    wanted: set[int] = set()
+    for record in records:
+        if record.get("needs_confirmation") and not record.get("is_book"):
+            wanted.add(int(record["ply"]) - 1)
+            wanted.add(int(record["ply"]))
+    return (
+        request.confirm_depth,
+        sorted(
+            index
+            for index in wanted
+            if 0 <= index <= len(request.moves) and _terminal_result(boards[index]) is None
+        ),
+    )
+
+
+def _client_line(raw: Mapping[str, Any], rank: int) -> dict[str, Any]:
+    """Normalize one browser MultiPV line into the pipeline's wire shape."""
+
+    best = raw.get("best_move") if isinstance(raw.get("best_move"), Mapping) else {}
+    uci = raw.get("uci") or best.get("uci")
+    score = raw.get("score_cp")
+    mate = raw.get("mate")
+    try:
+        score_cp = int(score) if score is not None else None
+        mate_value = int(mate) if mate is not None else None
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Engine scores must be whole numbers.") from exc
+    win = raw.get("win_prob_white")
+    if win is None:
+        if mate_value is not None:
+            win = 100.0 if mate_value > 0 else 0.0
+        elif score_cp is not None:
+            win = review_win_probability(score_cp)
+        else:
+            raise ValueError("An engine line needs a score or a mate distance.")
+    pv = raw.get("pv_uci") or raw.get("pv") or []
+    if not isinstance(pv, Sequence) or isinstance(pv, (str, bytes)):
+        raise ValueError("An engine line's PV must be a list.")
+    return {
+        "rank": int(raw.get("rank") or rank),
+        "uci": str(uci) if uci else None,
+        "san": raw.get("san"),
+        "score_cp": score_cp,
+        "mate": mate_value,
+        "win_prob_white": _clamp(float(win), 0.0, 100.0),
+        "pv_uci": [str(move) for move in pv if move],
+        "pv_san": [str(move) for move in (raw.get("pv_san") or []) if move],
+    }
+
+
+def search_results_from_payload(
+    request: ReviewRequest, payload: Mapping[str, Any] | None
+) -> dict[int, ReviewSearchResult]:
+    """Turn client-searched evaluations into pipeline search results.
+
+    ``payload`` maps a position index (``"0"``..``str(len(moves))``) to
+    ``{lines: [...], depth, cached, time_ms, terminal}``.  Terminal positions
+    are always supplied locally so a browser omission cannot change grading.
+    """
+
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, Mapping):
+        raise ValueError("Client evaluations must be an object keyed by position.")
+    results: dict[int, ReviewSearchResult] = {}
+    for key, raw in payload.items():
+        try:
+            index = int(key)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Client evaluation keys must be position indexes.") from exc
+        if index < 0 or index > len(request.moves):
+            raise ValueError(f"Client evaluation index {index} is outside the game.")
+        if not isinstance(raw, Mapping):
+            raise ValueError("Each client evaluation must be an object.")
+        lines = raw.get("lines")
+        if not isinstance(lines, Sequence) or isinstance(lines, (str, bytes)):
+            raise ValueError("Each client evaluation needs a list of lines.")
+        normalized = [
+            _client_line(line, position)
+            for position, line in enumerate(lines, start=1)
+            if isinstance(line, Mapping)
+        ]
+        if not normalized:
+            continue
+        try:
+            depth = int(raw.get("depth") or request.base_depth)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Client evaluation depth must be a number.") from exc
+        results[index] = ReviewSearchResult(
+            lines=normalized,
+            depth=depth,
+            multipv=int(raw.get("multipv") or len(normalized)),
+            cached=bool(raw.get("cached")),
+            nodes=int(raw.get("nodes") or 0),
+            time_ms=int(raw.get("time_ms") or 0),
+            terminal=raw.get("terminal"),
+        )
+    for index, board in enumerate(_replay(request)):
+        terminal = _terminal_result(board)
+        if terminal is not None:
+            results[index] = terminal
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Evaluation storage
 # ---------------------------------------------------------------------------
@@ -742,8 +901,14 @@ def run_game_review(
     on_progress: ProgressCallback | None = None,
     engine_name: str = "Stockfish",
     engine_version: str | None = None,
+    confirm: bool = True,
 ) -> dict[str, Any]:
-    """Run the two-pass review and return the versioned report payload."""
+    """Run the two-pass review and return the versioned report payload.
+
+    Pass ``confirm=False`` when the caller has first-pass evaluations only;
+    Brilliant/Great candidates then stay visibly unconfirmed instead of being
+    re-searched at a depth the callbacks cannot supply.
+    """
 
     if not isinstance(request, ReviewRequest):
         raise TypeError("run_game_review expects a ReviewRequest")
@@ -807,7 +972,7 @@ def run_game_review(
     _classify_all(records, boards, evals, confirmed_positions)
 
     # -- pass 2: confirm Brilliant/Great candidates ----------------------
-    if confirm_depth > base_depth:
+    if confirm and confirm_depth > base_depth:
         for _round in range(MAX_CONFIRM_ROUNDS):
             check_cancelled()
             pending = [

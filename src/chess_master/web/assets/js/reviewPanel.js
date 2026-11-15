@@ -162,11 +162,16 @@ function bookGlyph() {
 }
 
 export class ReviewPanel {
-  constructor({ onNavigate, onPreview, onSceneChange, onRetryChange } = {}) {
+  constructor({ onNavigate, onPreview, onSceneChange, onRetryChange, wasm = null, isClientEngine = () => false } = {}) {
     this.onNavigate = onNavigate || (() => {});
     this.onPreview = onPreview || (() => {});
     this.onSceneChange = onSceneChange || (() => {});
     this.onRetryChange = onRetryChange || (() => {});
+    this.wasm = wasm;
+    this.isClientEngine = isClientEngine;
+    this.clientActive = false;
+    this.clientCancelled = false;
+    this.clientReview = null;
     this.game = null;
     this.gameId = null;
     this.preset = "standard";
@@ -317,7 +322,13 @@ export class ReviewPanel {
     const plyChanged = Boolean(this.game && game && this.game.ply !== game.ply);
     this.game = game;
     this.gameId = game?.game_id || null;
+    if (changed && this.clientActive) {
+      this.clientCancelled = true;
+      this.wasm?.stop();
+    }
     if (changed) {
+      this.clientActive = false;
+      this.clientCancelled = false;
       this.resetLocal();
     } else if (this.preview && plyChanged) {
       // Main move-list navigation always leaves the temporary PV sandbox.
@@ -341,6 +352,7 @@ export class ReviewPanel {
     this.filter = null;
     this.currentMove = null;
     this.preview = null;
+    this.clientReview = null;
   }
 
   clearRetryLocal() {
@@ -349,6 +361,8 @@ export class ReviewPanel {
   }
 
   update(review) {
+    // Local WASM progress owns the panel until it hands the report to Python.
+    if (this.clientActive) return;
     this.review = review || null;
     const key = [
       this.gameId,
@@ -379,6 +393,13 @@ export class ReviewPanel {
     }
   }
 
+  setClientReview(review) {
+    this.clientReview = review;
+    this.review = review;
+    this.lastKey = "";
+    this.render();
+  }
+
   renderPreset() {
     for (const button of document.querySelectorAll("[data-review-preset]")) {
       const active = button.dataset.reviewPreset === this.preset;
@@ -389,7 +410,8 @@ export class ReviewPanel {
     if (this.refs.model) {
       const depth = PRESET_DEPTH[this.preset] || 14;
       const confirm = Math.min(depth + 2, 18);
-      this.refs.model.textContent = `Lichess logistic · depth ${depth} · confirm ${confirm} · MultiPV 3`;
+      const engine = this.isClientEngine() ? "Browser WASM · " : "";
+      this.refs.model.textContent = `${engine}Lichess logistic · depth ${depth} · confirm ${confirm} · MultiPV 3`;
     }
   }
 
@@ -454,15 +476,20 @@ export class ReviewPanel {
               : "See the game behind the moves.";
     }
     if (this.refs.heroCopy) {
+      const client = this.isClientEngine();
       this.refs.heroCopy.textContent = running
-        ? "The shared Stockfish worker is grading positions. You can navigate the board; the review keeps its game line."
+        ? client
+          ? "This browser is grading positions with Stockfish Lite. You can navigate the board; the review keeps its game line."
+          : "The shared Stockfish worker is grading positions. You can navigate the board; the review keeps its game line."
         : complete
           ? "Brilliant and Great candidates were re-checked two plies deeper. Every percentage below is final."
           : status === "cancelled"
             ? "Nothing was committed. Start again when the table is quiet."
             : status === "failed"
               ? review?.error || "The engine did not finish the review."
-              : "Stockfish grades every non-book ply, confirms Brilliant and Great moves two plies deeper, and measures accuracy with the approved review model.";
+              : client
+                ? "Stockfish Lite grades every non-book ply in this tab, confirms Brilliant and Great moves two plies deeper, and sends the results to the Python review model."
+                : "Stockfish grades every non-book ply, confirms Brilliant and Great moves two plies deeper, and measures accuracy with the approved review model.";
     }
 
     if (hasReport) {
@@ -1896,6 +1923,9 @@ export class ReviewPanel {
       });
       return;
     }
+    if (this.isClientEngine() && this.wasm) {
+      return this.startClientReview();
+    }
     this.busy = true;
     this.refs.run.disabled = true;
     this.stopPlayback();
@@ -1934,7 +1964,142 @@ export class ReviewPanel {
     }
   }
 
+  async startClientReview() {
+    this.busy = true;
+    if (this.refs.run) this.refs.run.disabled = true;
+    this.stopPlayback();
+    this.preview = null;
+    this.clientActive = true;
+    this.clientCancelled = false;
+    this.report = null;
+    this.loadedSignature = null;
+    this.failedSignature = null;
+    const progress = { done: 0, total: 1, percent: 0, phase: "scan" };
+    const review = {
+      status: "running",
+      depth: PRESET_DEPTH[this.preset] || 14,
+      progress,
+      signature: "client",
+      error: null,
+    };
+    this.setClientReview(review);
+    this.refs.dashboard?.closest(".tab-panel")?.scrollTo({ top: 0, behavior: "auto" });
+    this.onSceneChange();
+
+    const evals = {};
+    const confirmEvals = {};
+    const activeGameId = this.gameId;
+    const tick = (patch) => this.setClientReview({ ...review, ...patch });
+    const cancelled = () => {
+      if (this.clientCancelled) throw new Error("Review cancelled.");
+    };
+
+    try {
+      const plan = await call("prepare_client_review", this.preset, { use_book: true });
+      const terminals = new Set(plan.terminal_positions || []);
+      const positions = (plan.needed_positions || []).filter((index) => !terminals.has(index));
+      let total = Math.max(1, positions.length);
+      progress.total = total;
+      tick({ depth: plan.base_depth, progress: { ...progress } });
+
+      for (let step = 0; step < positions.length; step += 1) {
+        cancelled();
+        const index = positions[step];
+        const result = await this.wasm.runReviewSearch(
+          plan.fens[index],
+          plan.base_depth,
+          plan.multipv || 3,
+        );
+        cancelled();
+        if (!result) throw new Error("The browser engine stopped.");
+        evals[index] = result;
+        progress.done = step + 1;
+        progress.percent = Math.round((progress.done / total) * 100);
+        tick({ depth: plan.base_depth, progress: { ...progress } });
+      }
+
+      progress.phase = "confirm";
+      tick({ depth: plan.base_depth, progress: { ...progress } });
+      const confirmation = await call(
+        "find_review_confirm_positions",
+        this.preset,
+        evals,
+        { use_book: true },
+      );
+      const pending = (confirmation.positions || []).filter((item) => !terminals.has(item.index));
+      if (pending.length) {
+        total += pending.length;
+        progress.total = total;
+        for (let step = 0; step < pending.length; step += 1) {
+          cancelled();
+          const item = pending[step];
+          const result = await this.wasm.runReviewSearch(
+            item.fen,
+            confirmation.confirm_depth,
+            plan.multipv || 3,
+          );
+          cancelled();
+          if (!result) throw new Error("The browser engine stopped.");
+          confirmEvals[item.index] = result;
+          progress.done += 1;
+          progress.percent = Math.round((progress.done / total) * 100);
+          tick({ depth: plan.base_depth, progress: { ...progress } });
+        }
+      }
+
+      progress.done = total;
+      progress.percent = 100;
+      progress.phase = "aggregate";
+      tick({ depth: plan.base_depth, progress: { ...progress } });
+      const result = await call("complete_client_review", this.preset, evals, {
+        use_book: true,
+        confirm_evals: confirmEvals,
+      });
+      this.clientActive = false;
+      this.report = result.report || null;
+      this.loadedSignature = result.review?.signature || result.report?.signature || null;
+      this.update(result.review);
+      this.render();
+      this.onSceneChange();
+      toast({
+        title: "Review complete",
+        description: `${total} position${total === 1 ? "" : "s"} graded by the browser engine.`,
+        kind: "success",
+      });
+    } catch (error) {
+      this.clientActive = false;
+      const cancelledRun = this.clientCancelled;
+      if (this.gameId === activeGameId) {
+        this.setClientReview({
+          ...review,
+          status: cancelledRun ? "cancelled" : "failed",
+          error: cancelledRun ? null : errorMessage(error),
+          progress: { ...progress, percent: 100, phase: cancelledRun ? "cancelled" : "failed" },
+        });
+      }
+      if (!cancelledRun) {
+        toast({
+          title: "Could not finish the review",
+          description: errorMessage(error),
+          kind: "error",
+          duration: 6500,
+        });
+      }
+    } finally {
+      this.busy = false;
+      this.clientCancelled = false;
+      if (this.refs.run) this.refs.run.disabled = false;
+      this.render();
+    }
+  }
+
   async cancel() {
+    if (this.clientActive) {
+      this.clientCancelled = true;
+      this.wasm?.stop();
+      this.onSceneChange();
+      return;
+    }
     if (!this.isRunning()) return;
     try {
       const result = await call("cancel_game_review");
@@ -1958,7 +2123,9 @@ export class ReviewPanel {
     if (this.isRunning()) {
       toast({
         title: "Review already running",
-        description: "The shared Stockfish worker is grading this game.",
+        description: this.isClientEngine()
+          ? "This browser is grading the game."
+          : "The shared Stockfish worker is grading this game.",
         kind: "info",
         duration: 2800,
       });

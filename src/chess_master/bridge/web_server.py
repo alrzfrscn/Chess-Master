@@ -44,6 +44,7 @@ _EVENT_HEARTBEAT = 15.0
 
 mimetypes.add_type("text/javascript", ".js")
 mimetypes.add_type("text/css", ".css")
+mimetypes.add_type("application/wasm", ".wasm")
 mimetypes.add_type("image/svg+xml", ".svg")
 mimetypes.add_type("font/woff2", ".woff2")
 mimetypes.add_type("application/x-chess-pgn", ".pgn")
@@ -379,7 +380,14 @@ class WebAppServer:
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(data)))
-                self.send_header("Cache-Control", "no-cache")
+                # The 1.8 MB engine binary is content-addressed by version and
+                # safe to keep in the browser cache; the app shell is not.
+                cache = (
+                    "public, max-age=604800"
+                    if candidate.suffix.lower() == ".wasm"
+                    else "no-cache"
+                )
+                self.send_header("Cache-Control", cache)
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()
                 self.wfile.write(data)

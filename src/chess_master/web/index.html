@@ -1415,6 +1415,14 @@
         </div>
 
         <label class="field">
+          <span class="field-label">Where to search</span>
+          <select id="engine-mode-select" class="input">
+            <option value="client_wasm">This browser · Stockfish Lite WASM</option>
+            <option value="server_native">Desktop binary · native Stockfish</option>
+          </select>
+        </label>
+
+        <label class="field">
           <span class="field-label">Executable or folder</span>
           <input
             id="engine-path-input"
@@ -1425,6 +1433,11 @@
             placeholder="Auto-detect (bin/, assets/engine/, STOCKFISH_PATH)"
           />
         </label>
+
+        <p class="dialog-note">
+          The browser engine needs no server CPU and works on the web build. The native binary is
+          desktop-only and needs a path below.
+        </p>
 
         <p class="dialog-note">
           Discovery order: this path, <code>STOCKFISH_PATH</code>, project <code>bin/</code> and

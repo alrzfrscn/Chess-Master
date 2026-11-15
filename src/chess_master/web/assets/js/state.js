@@ -29,6 +29,10 @@ export const app = {
   clockAnchor: null,
   clockTimer: null,
   clockZeroKey: "",
+  engineMode: "client_wasm",
+  clientEvalKey: "",
+  clientBotKey: "",
+  clientBotBusy: false,
 };
 
 export function setGame(game) {

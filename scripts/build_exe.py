@@ -29,6 +29,7 @@ ENTRY_PATH = ROOT / "build" / "pyinstaller_entry.py"
 ZIP_PATH = DIST_ROOT / f"{APP_NAME}-v{VERSION}-win64-portable.zip"
 
 WEB_DIR = ROOT / "src" / "chess_master" / "web"
+VENDOR_STOCKFISH = WEB_DIR / "assets" / "vendor" / "stockfish"
 OPENINGS_TSV = ROOT / "src" / "chess_master" / "analysis" / "openings_data.tsv"
 LOCAL_STOCKFISH = ROOT / "bin" / "stockfish"
 
@@ -114,8 +115,21 @@ def _zip_app() -> Path:
     return ZIP_PATH
 
 
+def _check_wasm_engine() -> None:
+    missing = [
+        name
+        for name in ("stockfish-lite.js", "stockfish-lite.wasm")
+        if not (VENDOR_STOCKFISH / name).is_file()
+    ]
+    if missing:
+        raise SystemExit(
+            f"Vendored browser engine is incomplete ({', '.join(missing)}). Run `npm run vendor`."
+        )
+
+
 def build() -> Path:
     _run(["npm.cmd" if os.name == "nt" else "npm", "run", "build"])
+    _check_wasm_engine()
     icon = generate_icon()
     entry = _write_entry()
 

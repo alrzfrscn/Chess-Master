@@ -24,7 +24,15 @@ from typing import Any, Callable
 
 from chess_master import __version__
 from chess_master.analysis.openings import get_default_book
-from chess_master.analysis.review import CONFIRM_DEPTH_CAP, REVIEW_PRESETS
+from chess_master.analysis.review import (
+    CONFIRM_DEPTH_CAP,
+    REVIEW_PRESETS,
+    ReviewRequest,
+    confirm_positions,
+    review_plan,
+    run_game_review,
+    search_results_from_payload,
+)
 from chess_master.analysis.winprob import model_info
 from chess_master.bridge.rooms import Room, RoomManager
 from chess_master.engine.clock import TIME_CONTROL_PRESETS
@@ -646,6 +654,196 @@ class ChessMasterApi:
         return self._execute(operation)
 
     # -- game review -----------------------------------------------------
+    def _client_review_request(
+        self,
+        preset: str,
+        options: Mapping[str, Any] | None,
+    ) -> ReviewRequest:
+        """Validate a browser-assisted review request against the session."""
+
+        if self._fair_play():
+            raise InvalidInputError("Game Review unlocks when the online game is over.")
+        if not isinstance(preset, str) or preset.strip().lower() not in REVIEW_PRESETS:
+            raise InvalidInputError(
+                "Choose a review preset: fast, standard or deep.",
+                details={"preset": preset, "valid": list(REVIEW_PRESETS)},
+            )
+        if options is not None and not isinstance(options, Mapping):
+            raise InvalidInputError("Review options must be an object.")
+        incoming = options or {}
+        depth = incoming.get("depth")
+        if depth is not None:
+            if isinstance(depth, bool):
+                raise InvalidInputError("Review depth must be a whole number.")
+            try:
+                depth = int(depth)
+            except (TypeError, ValueError) as exc:
+                raise InvalidInputError("Review depth must be a whole number.") from exc
+            if depth < 6 or depth > CONFIRM_DEPTH_CAP:
+                raise InvalidInputError(
+                    f"Review depth must be from 6 to {CONFIRM_DEPTH_CAP}."
+                )
+        use_book = incoming.get("use_book", True)
+        if not isinstance(use_book, bool):
+            raise InvalidInputError("Review use_book must be true or false.")
+        session = self._session
+        if session.total_plies <= 0:
+            raise InvalidInputError(
+                "Play or import at least one move before running a review."
+            )
+
+        state = session.to_state()
+        players = state.get("players") or {}
+        baseline_white = None
+        baseline_black = None
+        bot_elo = session.engine_bot_elo
+        if session.mode == "stockfish" and bot_elo:
+            if session.engine_bot_color == "white":
+                baseline_white = int(bot_elo)
+            elif session.engine_bot_color == "black":
+                baseline_black = int(bot_elo)
+        return ReviewRequest(
+            game_id=session.game_id,
+            start_fen=session.start_fen,
+            moves=tuple(session.move_ucis()),
+            preset=preset.strip().lower(),
+            depth=depth,
+            white_name=str((players.get("white") or {}).get("name") or "White"),
+            black_name=str((players.get("black") or {}).get("name") or "Black"),
+            result=str((state.get("status") or {}).get("result") or "*"),
+            baseline_white=baseline_white,
+            baseline_black=baseline_black,
+            use_book=use_book,
+            owner=self._engine.owner_id,
+        )
+
+    @staticmethod
+    def _client_evals(
+        request: ReviewRequest, payload: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        try:
+            return search_results_from_payload(request, payload)
+        except ValueError as exc:
+            raise InvalidInputError(str(exc)) from exc
+
+    def prepare_client_review(
+        self,
+        preset: str = "standard",
+        options: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Plan the searches a browser WASM engine must run for a review."""
+
+        def operation() -> dict[str, Any]:
+            request = self._client_review_request(preset, options)
+            return review_plan(request, opening_book=get_default_book())
+
+        return self._execute(operation)
+
+    def find_review_confirm_positions(
+        self,
+        preset: str = "standard",
+        evals_payload: Mapping[str, Any] | None = None,
+        options: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Pass-1 grading, reduced to the Pass-2 positions worth re-searching."""
+
+        def operation() -> dict[str, Any]:
+            request = self._client_review_request(preset, options)
+            evals = self._client_evals(request, evals_payload)
+            confirm_depth, wanted = confirm_positions(
+                request, evals, opening_book=get_default_book()
+            )
+            plan = review_plan(request, opening_book=get_default_book())
+            return {
+                "signature": request.signature,
+                "confirm_depth": confirm_depth,
+                "positions": [
+                    {"index": index, "fen": plan["fens"][index]}
+                    for index in wanted
+                ],
+                "needed_positions": wanted,
+            }
+
+        return self._execute(operation)
+
+    def complete_client_review(
+        self,
+        preset: str = "standard",
+        evals_payload: Mapping[str, Any] | None = None,
+        options: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Grade a browser-searched game with the authoritative Python pipeline."""
+
+        def operation() -> dict[str, Any]:
+            request = self._client_review_request(preset, options)
+            evals = self._client_evals(request, evals_payload)
+            incoming = options or {}
+            plan = review_plan(request, opening_book=get_default_book())
+            missing = [
+                index
+                for index in plan["needed_positions"]
+                if index not in plan["terminal_positions"] and index not in evals
+            ]
+            if missing:
+                raise InvalidInputError(
+                    "Some positions were not searched by the browser engine.",
+                    details={"missing_positions": missing},
+                )
+
+            confirm_evals: dict[str, Any] = {}
+            if request.confirm_depth > request.base_depth:
+                try:
+                    confirm_evals = search_results_from_payload(
+                        request, incoming.get("confirm_evals")
+                    )
+                except ValueError as exc:
+                    raise InvalidInputError(str(exc)) from exc
+            merged = {**evals, **confirm_evals}
+            _depth, wanted = (
+                confirm_positions(request, merged, opening_book=get_default_book())
+                if merged
+                else (request.confirm_depth, [])
+            )
+            # Only run Pass 2 when every candidate it would inspect has a
+            # deeper evaluation; otherwise the report stays honestly unconfirmed.
+            confirmed = bool(confirm_evals) and all(
+                index in confirm_evals for index in wanted
+            )
+
+            queues: dict[tuple[str, int], list[int]] = {}
+            for index, fen in enumerate(plan["fens"]):
+                for depth in {request.base_depth, request.confirm_depth}:
+                    queues.setdefault((fen, depth), []).append(index)
+
+            def search(board: Any, depth: int, multipv: int) -> Any:
+                pending = queues.get((board.fen(), int(depth)))
+                if not pending:
+                    return None
+                index = pending.pop(0)
+                if int(depth) == request.confirm_depth:
+                    return confirm_evals.get(index) or evals.get(index)
+                return evals.get(index)
+
+            report = run_game_review(
+                request,
+                search,
+                opening_book=get_default_book(),
+                engine_name="Stockfish Lite (WASM)",
+                engine_version="19-lite-single",
+                confirm=confirmed,
+            )
+            self._engine.restore_review(
+                report, signature=request.signature, preset=request.preset
+            )
+            self._archive_review()
+            return {
+                "review": self._engine.review_payload(full=False),
+                "report": report,
+                "confirmed": confirmed,
+            }
+
+        return self._execute(operation)
+
     def start_game_review(
         self,
         preset: str = "standard",
@@ -910,6 +1108,9 @@ class ChessMasterApi:
                     "start_game_review",
                     "cancel_game_review",
                     "get_game_review",
+                    "prepare_client_review",
+                    "find_review_confirm_positions",
+                    "complete_client_review",
                     "save_current_game",
                     "list_archived_games",
                     "load_archived_game",
@@ -936,6 +1137,8 @@ class ChessMasterApi:
                     "multi_pv": True,
                     "engine_path_config": True,
                     "game_review": True,
+                    "client_review": True,
+                    "client_wasm": True,
                     "review_presets": list(REVIEW_PRESETS),
                     "clocks": True,
                     "time_controls": list(TIME_CONTROL_PRESETS),

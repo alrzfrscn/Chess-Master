@@ -15,6 +15,7 @@ const pieces = path.join(web, "assets", "pieces");
 
 const chessground = path.join(root, "node_modules", "chessground");
 const chessjs = path.join(root, "node_modules", "chess.js");
+const stockfish = path.join(root, "node_modules", "stockfish", "bin");
 
 async function exists(file) {
   try {
@@ -47,6 +48,23 @@ await copy(path.join(chessjs, "dist", "esm", "chess.js"), path.join(vendor, "che
 if (await exists(path.join(chessjs, "LICENSE"))) {
   await copy(path.join(chessjs, "LICENSE"), path.join(vendor, "chess.js", "LICENSE"));
 }
+
+// Stockfish 19 "lite single": one 1.8 MB NNUE build that runs in every modern
+// browser without COOP/COEP SharedArrayBuffer headers. The worker script finds
+// its wasm by replacing `.js` with `.wasm`, so both names must stay in step.
+console.log("Copying Stockfish Lite WASM");
+const engineJs = path.join(stockfish, "stockfish-19-lite-single.js");
+const engineWasm = path.join(stockfish, "stockfish-19-lite-single.wasm");
+for (const file of [engineJs, engineWasm]) {
+  if (!(await exists(file))) {
+    throw new Error(
+      `Missing ${path.relative(root, file)}. Run \`npm install\` before \`npm run vendor\`.`,
+    );
+  }
+}
+await copy(engineJs, path.join(vendor, "stockfish", "stockfish-lite.js"));
+await copy(engineWasm, path.join(vendor, "stockfish", "stockfish-lite.wasm"));
+await copy(path.join(root, "node_modules", "stockfish", "Copying.txt"), path.join(vendor, "stockfish", "LICENSE"));
 
 // Extract the embedded cburnett SVGs. These are the same source pieces used by
 // the board itself, so captured pieces and promotion choices match exactly.

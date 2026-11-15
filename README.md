@@ -67,9 +67,11 @@ ten-tier accuracy matrix.
 - Windows 10/11 with the Microsoft Edge WebView2 runtime.
 - Python 3.11 or newer.
 - Node.js 20+ only when rebuilding CSS or vendor assets.
-- A Stockfish binary. Place one at `bin/stockfish/` (the v1.0.0 build used
-  Stockfish 19 universal on Windows), set `STOCKFISH_PATH`, or choose it in
-  **Engine setup**. The local `bin/` folder is ignored by git.
+- A Stockfish binary, only for native mode. The browser build ships Stockfish 19
+  Lite (WASM) and needs nothing installed. For the desktop binary, place one at
+  `bin/stockfish/` (the v1.0.0 build used Stockfish 19 universal on Windows), set
+  `STOCKFISH_PATH`, or choose it in **Engine setup**. The local `bin/` folder is
+  ignored by git.
 
 ### Install and run the desktop app
 
@@ -157,9 +159,10 @@ $env:PYTHONPATH = "src"
 
 `--host` defaults to `127.0.0.1`; any bind address works and
 `CHESS_MASTER_HOST` / `CHESS_MASTER_PORT` (or `PORT`) are read when the flags are
-omitted. Each browser tab gets an isolated session and shares one SQLite archive
-and one Stockfish process; rooms, invites, spectators and reconnect by browser
-`client_id` work as in the desktop app.
+omitted. Each browser tab gets an isolated session and shares one SQLite archive;
+every tab grades and plays with its own Stockfish Lite worker unless **Engine
+setup** switches it to the server's native binary. Rooms, invites, spectators and
+reconnect by browser `client_id` work as in the desktop app.
 
 Docker deployment:
 
@@ -168,9 +171,11 @@ docker compose up --build
 ```
 
 The image builds the frontend in a `node:20-alpine` stage and runs the Python
-server on `python:3.12-slim` with the Debian `stockfish` package. Port `8000` is
-published and `./state` is mounted at `/app/state` for SQLite persistence. The
-healthcheck polls `http://127.0.0.1:8000/api/health`.
+server on `python:3.12-slim` without a Stockfish package: browser tabs search
+with the vendored WASM engine, so the container stays small and needs no
+COOP/COEP headers. Port `8000` is published and `./state` is mounted at
+`/app/state` for SQLite persistence. The healthcheck polls
+`http://127.0.0.1:8000/api/health`.
 
 ### Build and test
 
@@ -416,6 +421,13 @@ packaged desktop window.
   `PovScore.pov(chess.WHITE)`. Mate maps to exact 0/100 win probability;
   ordinary scores use the Lichess logistic curve with `K = 0.00368208` and a
   ±1500 cp clamp. Labels are `+1.4`, `-0.8`, `0.0`, `M3` and `-M2`.
+- **Browser engine.** `assets/vendor/stockfish/stockfish-lite.js` (Stockfish 19
+  Lite, single-threaded, no `SharedArrayBuffer`) runs in a Web Worker owned by
+  `web/assets/js/wasmEngine.js`: live analysis, bot moves and Game Review all go
+  through it, with the same Elo profiles, pacing and White-POV constants as the
+  native path. Python stays authoritative for classification, metrics, openings
+  and SQLite — the browser posts raw evals to `prepare_client_review`,
+  `find_review_confirm_positions` and `complete_client_review`.
 
 ## Tests and QA
 
@@ -448,8 +460,9 @@ matrix filtering and row jumps, key moments via buttons and `K` / `Shift+K` /
 
 ## v1.0.0 limits
 
-- One Stockfish process per application instance. A second table cannot run a
-  second engine concurrently.
+- Native mode runs one Stockfish process per application instance, so a second
+  table cannot run a second native engine concurrently. Browser mode gives every
+  tab its own WASM worker instead.
 - One main line per session; PGN variations are read as metadata, not stored as
   a tree.
 - No persistence database: state and the analysis cache live in memory for the

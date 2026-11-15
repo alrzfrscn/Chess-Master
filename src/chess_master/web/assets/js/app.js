@@ -10,6 +10,7 @@ import { renderMoves } from "./moves.js";
 import { anchorClock, remainingClock, renderClocks, renderPlayers } from "./players.js";
 import { ReviewPanel } from "./reviewPanel.js";
 import { sound } from "./sound.js";
+import { WasmEngineClient } from "./wasmEngine.js";
 import {
   app,
   canHumanMove,
@@ -111,9 +112,61 @@ let editorPanel = null;
 let tabs = null;
 let booting = false;
 let lastReviewSignature = "";
+let wasmEngine = null;
+let clientAnalysisTimer = null;
 
 const THEME_KEY = "chessMaster.boardTheme";
 const THEMES = ["jade", "classic", "walnut", "ice"];
+const ENGINE_MODE_KEY = "chessMaster.engineMode";
+
+/** Browser engine used by live analysis, bot moves and review on the web. */
+function clientEngine() {
+  if (!wasmEngine) {
+    wasmEngine = new WasmEngineClient({
+      onStatus: () => {
+        if (app.engineMode !== "client_wasm") return;
+        app.engine = wasmEngine.statusPayload();
+        renderEngineStatusCard();
+        renderEval(app.game);
+      },
+    });
+  }
+  return wasmEngine;
+}
+
+function storedEngineMode() {
+  try {
+    return window.localStorage.getItem(ENGINE_MODE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function setEngineMode(mode) {
+  app.engineMode = mode === "server_native" ? "server_native" : "client_wasm";
+  try {
+    window.localStorage.setItem(ENGINE_MODE_KEY, app.engineMode);
+  } catch {
+    /* private mode: keep the choice for this tab only */
+  }
+  const select = $("engine-mode-select");
+  if (select) select.value = app.engineMode;
+  if (app.engineMode === "client_wasm") {
+    const client = clientEngine();
+    app.engine = client.statusPayload();
+    client.start().catch((error) => console.warn("Browser engine unavailable", error));
+    app.evaluation = null;
+    app.clientEvalKey = "";
+  } else {
+    app.engine = app.game?.engine || app.engine;
+    app.evaluation = null;
+    app.clientEvalKey = "";
+  }
+  renderEngineStatusCard();
+  renderAll();
+  scheduleClientAnalysis();
+  maybeClientBotMove();
+}
 
 /* --------------------------------------------------------------------------
    State rendering
@@ -215,7 +268,10 @@ function renderEval(game) {
   if (!rail) return;
   rail.dataset.orientation = app.orientation;
 
-  const evaluation = app.evaluation || (game && game.evaluation) || null;
+  const evaluation =
+    app.evaluation ||
+    (app.engineMode === "client_wasm" ? null : (game && game.evaluation)) ||
+    null;
   const engine = app.engine || (game && game.engine) || null;
   const thinking = Boolean(evaluation && evaluation.thinking);
   const available = Boolean(evaluation && evaluation.available) && !isEngineOffline(engine);
@@ -268,7 +324,113 @@ function renderEval(game) {
 }
 
 function isEngineOffline(engine) {
+  if (app.engineMode === "client_wasm" && engine?.mode === "client_wasm") {
+    return engine.status === "error";
+  }
   return Boolean(engine && (!engine.available || engine.status === "error"));
+}
+
+/** Debounced live analysis on the browser engine. */
+function scheduleClientAnalysis() {
+  if (app.engineMode !== "client_wasm") return;
+  window.clearTimeout(clientAnalysisTimer);
+  clientAnalysisTimer = window.setTimeout(runClientAnalysis, 220);
+}
+
+async function runClientAnalysis() {
+  const game = app.game;
+  if (
+    app.engineMode !== "client_wasm" ||
+    !game ||
+    !(app.evalVisible || app.arrowsEnabled) ||
+    (game.room && game.room.status !== "finished") ||
+    game.status?.state !== "in_progress"
+  ) {
+    return;
+  }
+  const token = {
+    game_id: game.game_id,
+    revision: game.revision,
+    ply: game.ply,
+    fen: game.fen,
+  };
+  const key = [token.game_id, token.revision, token.ply, token.fen].join("|");
+  if (app.clientEvalKey === key && app.evaluation) return;
+  app.clientEvalKey = key;
+  const options = game.engine?.analysis || {};
+  try {
+    const result = await clientEngine().analyzePosition(
+      token,
+      game.start_fen,
+      [],
+      Number(options.depth) || 12,
+      Number(options.multipv) || 3,
+    );
+    const current = app.game;
+    if (
+      !result ||
+      !current ||
+      current.game_id !== token.game_id ||
+      current.revision !== token.revision ||
+      current.ply !== token.ply
+    ) {
+      return;
+    }
+    app.evaluation = result;
+    renderEval(current);
+    syncArrows();
+  } catch (error) {
+    app.clientEvalKey = "";
+    console.warn("Browser analysis failed", error);
+  }
+}
+
+/** Let the browser engine answer a bot turn when no native worker exists. */
+async function maybeClientBotMove() {
+  const game = app.game;
+  if (
+    app.engineMode !== "client_wasm" ||
+    app.clientBotBusy ||
+    !game ||
+    game.mode !== "stockfish" ||
+    game.status?.state !== "in_progress" ||
+    (game.room && game.room.status !== "finished") ||
+    !game.engine?.bot_color ||
+    game.turn !== game.engine.bot_color ||
+    game.engine.available
+  ) {
+    return;
+  }
+  const key = `${game.game_id}|${game.revision}|${game.ply}`;
+  if (app.clientBotKey === key) return;
+  app.clientBotKey = key;
+  app.clientBotBusy = true;
+  try {
+    const move = await clientEngine().computeBotMove(
+      { game_id: game.game_id, revision: game.revision, ply: game.ply, fen: game.fen },
+      game.start_fen,
+      [],
+      Number(game.engine.bot_elo) || 1400,
+      game.engine.bot_pace || "blitz",
+      remainingClock(game.engine.bot_color),
+    );
+    const current = app.game;
+    if (
+      !move ||
+      !current ||
+      current.game_id !== game.game_id ||
+      current.revision !== game.revision ||
+      current.ply !== game.ply ||
+      current.turn !== game.engine?.bot_color
+    ) {
+      return;
+    }
+    await playMove(move);
+  } catch (error) {
+    console.warn("Browser bot move failed", error);
+  } finally {
+    app.clientBotBusy = false;
+  }
 }
 
 function applyReviewScene() {
@@ -287,7 +449,10 @@ function syncArrows() {
   if (!board) return;
   if (applyReviewScene()) return;
   const game = app.game;
-  const evaluation = app.evaluation || (game && game.evaluation);
+  const evaluation =
+    app.evaluation ||
+    (app.engineMode === "client_wasm" ? null : (game && game.evaluation)) ||
+    null;
   if (!app.arrowsEnabled || !game || !evaluation || !evaluation.best_move) {
     board.clearArrows();
     return;
@@ -305,9 +470,21 @@ function syncArrows() {
 function applyState(state, { autoOrient = false } = {}) {
   if (!state) return;
   const gameChanged = app.game?.game_id !== state.game_id;
+  const previousEval = app.evaluation;
   app.game = state;
   app.evaluation = state.evaluation || null;
   app.engine = state.engine || null;
+  if (app.engineMode === "client_wasm") {
+    const token = previousEval?.token;
+    const fresh =
+      token &&
+      token.game_id === state.game_id &&
+      token.revision === state.revision &&
+      token.ply === state.ply;
+    app.evaluation = fresh ? previousEval : null;
+    const client = wasmEngine ? wasmEngine.statusPayload() : null;
+    if (client) app.engine = { ...(state.engine || {}), ...client };
+  }
   const seat = state.room?.seat;
   if (seat && (autoOrient || gameChanged)) app.orientation = seat;
   else if (autoOrient && state.orientation) app.orientation = state.orientation;
@@ -320,6 +497,8 @@ function applyState(state, { autoOrient = false } = {}) {
     historyPanel?.refreshCount();
   }
   app.stateFingerprint = stateFingerprint(state);
+  scheduleClientAnalysis();
+  maybeClientBotMove();
 }
 
 function renderHeader(game) {
@@ -1062,6 +1241,7 @@ async function toggleEval() {
   renderEval(app.game);
   syncArrows();
   await pushAnalysisOptions();
+  scheduleClientAnalysis();
   pollSoon(60);
 }
 
@@ -1094,20 +1274,23 @@ async function toggleArrows() {
     });
   }
   await pushAnalysisOptions();
+  scheduleClientAnalysis();
   pollSoon(60);
 }
 
 async function pushAnalysisOptions() {
   try {
     const result = await call("set_analysis_options", {
-      enabled: Boolean(app.evalVisible || app.arrowsEnabled),
-      arrows: Boolean(app.arrowsEnabled),
+      enabled: app.engineMode === "server_native" && Boolean(app.evalVisible || app.arrowsEnabled),
+      arrows: app.engineMode === "server_native" && Boolean(app.arrowsEnabled),
     });
     if (result && app.game) {
       if (result.engine) app.game.engine = result.engine;
-      if (result.evaluation) app.game.evaluation = result.evaluation;
-      app.engine = result.engine || app.engine;
-      app.evaluation = result.evaluation || app.evaluation;
+      if (app.engineMode === "server_native") {
+        if (result.evaluation) app.game.evaluation = result.evaluation;
+        app.engine = result.engine || app.engine;
+        app.evaluation = result.evaluation || app.evaluation;
+      }
       renderAll();
     }
   } catch (error) {
@@ -1194,6 +1377,8 @@ function openImport() {
 function renderEngineStatusCard() {
   const engine = app.engine;
   if (!refs.engineStatusCard) return;
+  const client = engine?.mode === "client_wasm";
+  const name = (client ? engine.engine : engine?.name) || "Stockfish";
   const offline = isEngineOffline(engine);
   const ready = Boolean(engine && engine.available && engine.status === "ready");
   refs.engineStatusCard.classList.toggle("is-warning", offline);
@@ -1206,15 +1391,19 @@ function renderEngineStatusCard() {
     refs.engineStatusTitle.textContent = offline
       ? engine?.status === "error"
         ? "Engine failed to start"
-        : "Stockfish not found"
+        : client
+          ? "Browser engine unavailable"
+          : "Stockfish not found"
       : ready
-        ? `${engine.name || "Stockfish"} ready`
-        : "Starting Stockfish";
+        ? `${name} ready`
+        : `Starting ${name}`;
   }
   if (refs.engineStatusCopy) {
     refs.engineStatusCopy.textContent = offline
-      ? engine?.message || engine?.note || "Choose a Stockfish executable below."
-      : engine?.path || "One engine process, one owner thread.";
+      ? engine?.message || engine?.note || (client ? "Reload the page to try again." : "Choose a Stockfish executable below.")
+      : client
+        ? engine?.note || "Stockfish Lite runs in this browser tab."
+        : engine?.path || "One engine process, one owner thread.";
   }
   if (refs.engineStatusBadge) {
     refs.engineStatusBadge.textContent = offline
@@ -1230,6 +1419,8 @@ function openEngineDialog() {
   if (!refs.engineDialog) return;
   const input = $("engine-path-input");
   if (input) input.value = app.engine?.path || "";
+  const select = $("engine-mode-select");
+  if (select) select.value = app.engineMode;
   renderEngineStatusCard();
   openDialog(refs.engineDialog);
   requestAnimationFrame(() => input?.focus());
@@ -1239,6 +1430,17 @@ async function configureEngine(event) {
   event?.preventDefault();
   const input = $("engine-path-input");
   if (!input || app.busy) return;
+  const mode = $("engine-mode-select")?.value;
+  if (mode && mode !== app.engineMode) setEngineMode(mode);
+  if (app.engineMode === "client_wasm") {
+    toast({
+      title: "Browser engine selected",
+      description: "Stockfish Lite runs in this tab. Nothing is searched on the server.",
+      kind: "success",
+      duration: 5000,
+    });
+    return;
+  }
   const path = input.value.trim();
   app.busy = true;
   const save = $("btn-engine-save");
@@ -1281,6 +1483,7 @@ async function configureEngine(event) {
 function autoDetectEngine() {
   const input = $("engine-path-input");
   if (input) input.value = "";
+  if (app.engineMode !== "server_native") setEngineMode("server_native");
   configureEngine();
 }
 
@@ -1337,6 +1540,8 @@ function wireShell() {
   });
 
   reviewPanel = new ReviewPanel({
+    wasm: clientEngine(),
+    isClientEngine: () => app.engineMode === "client_wasm",
     onNavigate: (ply) => navigateTo(ply),
     onPreview: (preview) => {
       const previous = app.preview;
@@ -1681,10 +1886,17 @@ async function bootstrap() {
     app.apiInfo = info;
     app.samples = samples && Array.isArray(samples.samples) ? samples.samples : [];
     app.bridgeMode = app.bridgeMode || (window.pywebview ? "native" : "http");
+    app.engineMode =
+      storedEngineMode() || (app.bridgeMode === "native" ? "server_native" : "client_wasm");
 
     if (panel) panel.setSamples(app.samples);
     editorPanel?.setDrills(drills && Array.isArray(drills.drills) ? drills.drills : []);
     if (state) applyState(state);
+    if (app.engineMode === "server_native" && state?.engine?.status === "missing") {
+      setEngineMode("client_wasm");
+    } else if (app.engineMode === "client_wasm") {
+      clientEngine().start().catch((error) => console.warn("Browser engine unavailable", error));
+    }
     const sharedGame = requestedGameId();
     if (sharedGame) await openSharedGame(sharedGame);
     const sharedRoom = requestedRoomId();

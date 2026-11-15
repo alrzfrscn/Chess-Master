@@ -15,12 +15,7 @@ FROM python:3.12-slim AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     CHESS_MASTER_HOST=0.0.0.0 \
-    PORT=8000 \
-    STOCKFISH_PATH=/usr/games/stockfish
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends stockfish \
-    && rm -rf /var/lib/apt/lists/*
+    PORT=8000
 
 WORKDIR /app
 
