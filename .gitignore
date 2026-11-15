@@ -22,3 +22,5 @@ Thumbs.db
 chess_master_source_bundle.txt
 all_files.txt
 update_all_files.py
+chess_master_ai_context_bundle.txt
+Export-ProjectForAI.ps1
