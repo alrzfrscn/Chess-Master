@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import chess
+import chess.pgn
 import pytest
 
 from chess_master.engine.errors import InvalidPgnError
 from chess_master.engine.game import GameSession
-from chess_master.engine.pgn_io import build_pgn, parse_pgn
+from chess_master.engine.pgn_io import _count_variation_edges, build_pgn, parse_pgn
 from chess_master.models.samples import SAMPLES
 
 
@@ -169,3 +170,16 @@ def test_famous_pgn_samples_are_valid(sample) -> None:
 def test_fen_samples_are_valid(sample) -> None:
     board = chess.Board(sample["text"])
     assert board.is_valid()
+
+def test_variation_count_walks_a_deep_tree_iteratively() -> None:
+    root = chess.pgn.Game()
+    node = root
+    for _ in range(1200):
+        node = node.add_variation(chess.Move.from_uci("a2a3"))
+    assert _count_variation_edges(root) == 0
+
+    branch = chess.pgn.Game()
+    child = branch.add_variation(chess.Move.from_uci("e2e4"))
+    child.add_variation(chess.Move.from_uci("e7e5"))
+    child.add_variation(chess.Move.from_uci("c7c5"))
+    assert _count_variation_edges(branch) == 1

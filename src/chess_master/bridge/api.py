@@ -98,6 +98,7 @@ class ChessMasterApi:
         self._room_id: str | None = None
         self._saved_reviews: set[str] = set()
         self._saved_terminals: set[tuple[str, int, str]] = set()
+        self._cleared_game_id: str | None = None
 
     @property
     def store(self) -> GameStore:
@@ -216,7 +217,10 @@ class ChessMasterApi:
         return state
 
     def _bind_session(self, session: GameSession) -> None:
+        previous_game_id = self._session.game_id
         self._session = session
+        if session.game_id != previous_game_id:
+            self._cleared_game_id = None
         self._engine.bind(session)
         if session.mode == "stockfish" and self._engine.worker.available:
             self._engine.worker.ensure_started()
@@ -225,6 +229,8 @@ class ChessMasterApi:
     # -- local archive ---------------------------------------------------
     def _archive_current(self, *, force: bool = False) -> dict[str, Any] | None:
         session = self._session
+        if self._cleared_game_id == session.game_id:
+            return None
         if not force and session.total_plies < 2:
             return None
         return self._store.upsert_game(
@@ -250,10 +256,17 @@ class ChessMasterApi:
         self._saved_terminals.add(key)
 
     def _archive_review(self) -> None:
+        compact = self._engine.game_review(full=False)
+        signature = compact.get("signature")
+        if (
+            compact.get("status") != "complete"
+            or not signature
+            or str(signature) in self._saved_reviews
+        ):
+            return
         payload = self._engine.game_review(full=True)
         report = payload.get("report")
-        signature = payload.get("signature") or (report or {}).get("signature")
-        if not report or not signature or signature in self._saved_reviews:
+        if not report:
             return
         record = self._archive_current(force=True)
         if record is None:
@@ -273,6 +286,7 @@ class ChessMasterApi:
             schema_version=report.get("schema_version"),
             report=report,
             completed_at=timing.get("finished_at"),
+            client_id=self._client_id,
         )
         self._store.upsert_game(
             {
@@ -496,6 +510,7 @@ class ChessMasterApi:
                 if seat != self._session.turn:
                     raise InvalidInputError("It is not your turn.")
             self._session.make_move(move)
+            self._cleared_game_id = None
             self._sync_engine()
             if room is not None:
                 self._rooms.touch(room)
@@ -523,6 +538,49 @@ class ChessMasterApi:
         """Return the full serialized game state."""
 
         return self._execute(self._compose_state)
+
+    def _state_fingerprint(self) -> dict[str, Any]:
+        """A cheap SSE snapshot: scalar reads only, never the full state."""
+
+        def snapshot() -> dict[str, Any]:
+            session = self._session
+            status = session.status()
+            room = self._room()
+            seat = room.seat_for(self._client_id, self._session_id) if room else None
+            engine = self._engine.fingerprint_info()
+            return {
+                "ok": True,
+                "game_id": session.game_id,
+                "revision": session.revision,
+                "ply": session.view_ply,
+                "total_plies": session.total_plies,
+                "status": status.get("state"),
+                "turn": session.turn,
+                "draw_offer_by": status.get("draw_offer_by"),
+                "room_id": room.room_id if room else None,
+                "room_status": room.status if room else None,
+                "seat": seat,
+                "seats": {"white": True, "black": bool(room.black_client)} if room else None,
+                "fair_play": bool(room is not None and room.status != "finished"),
+                "rematch_available": bool(
+                    room is not None and room.status == "finished" and seat is not None
+                ),
+                "thinking": bool(engine.get("thinking")),
+                "engine_status": engine.get("status"),
+                "evaluation_updated_at": engine.get("evaluation_updated_at"),
+                "depth": engine.get("depth"),
+                "score_text": engine.get("score_text"),
+                "review_status": engine.get("review_status"),
+                "review_signature": engine.get("review_signature"),
+                "review_done": engine.get("review_done"),
+                "review_total": engine.get("review_total"),
+            }
+
+        with self._lock:
+            if self._room() is None:
+                return snapshot()
+            with self._rooms.lock:
+                return snapshot()
 
     def export_pgn(self) -> dict[str, Any]:
         """Serialize the current main line to PGN."""
@@ -750,10 +808,20 @@ class ChessMasterApi:
         def operation() -> dict[str, Any]:
             request = self._client_review_request(preset, options)
             evals = self._client_evals(request, evals_payload)
+            plan = review_plan(request, opening_book=get_default_book())
+            missing = [
+                index
+                for index in plan["needed_positions"]
+                if index not in plan["terminal_positions"] and index not in evals
+            ]
+            if missing:
+                raise InvalidInputError(
+                    "Some positions were not searched by the browser engine.",
+                    details={"missing_positions": missing},
+                )
             confirm_depth, wanted = confirm_positions(
                 request, evals, opening_book=get_default_book()
             )
-            plan = review_plan(request, opening_book=get_default_book())
             return {
                 "signature": request.signature,
                 "confirm_depth": confirm_depth,
@@ -832,6 +900,11 @@ class ChessMasterApi:
                 engine_version="19-lite-single",
                 confirm=confirmed,
             )
+            # Browser searches are self-reported: label them so the archive and
+            # API payloads never claim the server engine read those positions.
+            report.setdefault("engine", {})
+            report["engine"]["source"] = "client_wasm"
+            report["engine"]["self_reported"] = True
             self._engine.restore_review(
                 report, signature=request.signature, preset=request.preset
             )
@@ -930,6 +1003,7 @@ class ChessMasterApi:
         """Write the live session to SQLite, even mid-game."""
 
         def operation() -> dict[str, Any]:
+            self._cleared_game_id = None
             record = self._archive_current(force=True)
             return {
                 "saved": record is not None,
@@ -1015,7 +1089,7 @@ class ChessMasterApi:
         def operation() -> dict[str, Any]:
             if not isinstance(game_id, str) or not game_id.strip():
                 raise InvalidInputError("Choose an archived game to delete.")
-            deleted = self._store.delete_game(game_id.strip())
+            deleted = self._store.delete_game(game_id.strip(), client_id=self._client_id)
             return {
                 "deleted": deleted,
                 "game_id": game_id.strip(),
@@ -1029,6 +1103,7 @@ class ChessMasterApi:
 
         def operation() -> dict[str, Any]:
             deleted = self._store.clear(client_id=self._client_id)
+            self._cleared_game_id = self._session.game_id
             self._saved_reviews.clear()
             self._saved_terminals.clear()
             # Keep the live session from being re-archived by the next engine poll.
@@ -1062,6 +1137,11 @@ class ChessMasterApi:
                 if isinstance(game_ids, (str, bytes)) or not isinstance(game_ids, Sequence):
                     raise InvalidInputError("Archive export expects a list of game ids.")
                 rows = [self._store.get_game(str(game_id)) for game_id in game_ids]
+                rows = [
+                    row
+                    for row in rows
+                    if row and (row.get("client_id") or "local") == self._client_id
+                ]
             else:
                 rows, _ = self._store.list_games(
                     limit=500, offset=0, client_id=self._client_id

@@ -119,6 +119,7 @@ class EngineCoordinator:
         self._review_report: dict[str, Any] | None = None
         self._review_signature: str | None = None
         self._review_run_id: int | None = None
+        self._detached = False
         self._options = {
             "enabled": True,
             "arrows": False,
@@ -139,6 +140,33 @@ class EngineCoordinator:
     def options(self) -> dict[str, Any]:
         with self._lock:
             return dict(self._options)
+
+    @property
+    def detached(self) -> bool:
+        """True once the coordinator has released its shared worker owner."""
+
+        return self._detached
+
+    def fingerprint_info(self) -> dict[str, Any]:
+        """Scalar state for the SSE fingerprint; never copies a report or lines."""
+
+        status = self._worker.status_payload()
+        with self._lock:
+            analysis = self._analysis
+            review = self._review
+            progress = (review or {}).get("progress") or {}
+            return {
+                "thinking": bool(self._thinking),
+                "status": status.get("status"),
+                "evaluation_updated_at": (analysis or {}).get("updated_at"),
+                "depth": (analysis or {}).get("depth"),
+                "score_text": (analysis or {}).get("score_text"),
+                "review_status": (review or {}).get("status"),
+                "review_signature": (review or {}).get("signature"),
+                "review_done": progress.get("done"),
+                "review_total": progress.get("total"),
+                "detached": self._detached,
+            }
 
     def set_options(self, **options: Any) -> dict[str, Any]:
         with self._lock:
@@ -801,6 +829,7 @@ class EngineCoordinator:
     def detach(self) -> None:
         """Stop listening to a shared worker without stopping it."""
 
+        self._detached = True
         release = getattr(self._worker, "release_owner", None)
         if release is not None:
             release(self._owner_id)

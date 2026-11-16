@@ -40,12 +40,14 @@ class PgnImport:
         }
 
 
-def _count_variation_edges(node: chess.pgn.ChildNode) -> int:
+def _count_variation_edges(root: chess.pgn.GameNode) -> int:
     total = 0
-    for child in node.variations:
-        total += _count_variation_edges(child)
-    if len(node.variations) > 1:
-        total += len(node.variations) - 1
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if len(node.variations) > 1:
+            total += len(node.variations) - 1
+        stack.extend(node.variations)
     return total
 
 

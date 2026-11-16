@@ -20,6 +20,7 @@ from chess_master.engine.errors import (
     IllegalMoveError,
     InvalidInputError,
     InvalidModeError,
+    InvalidPgnError,
     InvalidPlyError,
     PromotionRequiredError,
 )
@@ -432,7 +433,16 @@ class GameSession:
                 }
         board = chess.Board(start_fen)
         moves: list[MoveRecord] = []
-        for item in _json_list(record.get("moves_json")):
+        items = _json_list(record.get("moves_json"))
+        if not items:
+            # The archive list omits moves_json; the stored PGN can rebuild it.
+            pgn_text = str(record.get("pgn") or "").strip()
+            if pgn_text:
+                try:
+                    items = [move.to_dict() for move in parse_pgn(pgn_text).moves]
+                except InvalidPgnError:
+                    items = []
+        for item in items:
             try:
                 move = chess.Move.from_uci(str(item.get("uci") or ""))
             except ValueError:

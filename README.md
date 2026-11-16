@@ -29,6 +29,14 @@ ten-tier accuracy matrix.
 - **Engine discovery.** Explicit config/CLI, `STOCKFISH_PATH`, project `bin/`
   and `assets/engine/`, then `PATH`, with a path dialog and a graceful offline
   state that never blocks Pass & Play.
+- **Board editor.** Set up any legal position by dragging pieces, switch side to
+  move and castling rights, then play or export it as FEN.
+- **Endgame drills.** Curated endgame and tactical positions (`drills.py`) start
+  as Stockfish games at the recommended Elo for that exercise.
+- **Local archive.** Every finished game and completed review is stored in
+  SQLite (`state/chess_master.db`, `src/chess_master/storage/db.py`) with
+  per-client ownership, so the history dashboard, stats and share links survive
+  a restart.
 
 ### Game Review
 
@@ -159,10 +167,13 @@ $env:PYTHONPATH = "src"
 
 `--host` defaults to `127.0.0.1`; any bind address works and
 `CHESS_MASTER_HOST` / `CHESS_MASTER_PORT` (or `PORT`) are read when the flags are
-omitted. Each browser tab gets an isolated session and shares one SQLite archive;
-every tab grades and plays with its own Stockfish Lite worker unless **Engine
-setup** switches it to the server's native binary. Rooms, invites, spectators and
-reconnect by browser `client_id` work as in the desktop app.
+omitted. Each browser tab gets an isolated `ChessMasterApi` through
+`SessionManager`, sharing one SQLite archive and one Stockfish process. Online
+`RoomManager` tables support invites, two seats, spectators and rematch; every
+tab grades and plays with its own Stockfish Lite WASM worker (`wasmEngine.js`)
+unless **Engine setup** switches it to the server's native binary. Room
+invites, spectators and reconnect by browser `client_id` work as in the desktop
+app.
 
 Docker deployment:
 
@@ -252,7 +263,7 @@ Chess Master/
 |           |-- pieces/        Bundled SVG piece set
 |           `-- vendor/        Chessground 9.2.1 and chess.js 1.4.0
 |-- bin/stockfish/             Local Stockfish binary (not a build artifact)
-|-- tests/                     281 pytest checks across analysis, engine, bridge and packaging
+|-- tests/                     291 pytest checks across analysis, engine, bridge and packaging
 |-- scripts/
 |   |-- sync_vendor.mjs        Reproducible vendor asset sync
 |   |-- build_exe.py           PyInstaller build, icon, Stockfish copy and portable zip
@@ -441,7 +452,7 @@ Stockfish flow, Import-mode evaluation/arrows, human-as-Black orientation, the
 review report contract, PV follow-up, chart points and key moments.
 
 ```text
-180 passed in 9.21s
+291 passed
 ```
 
 Smoke test:
@@ -465,8 +476,8 @@ matrix filtering and row jumps, key moments via buttons and `K` / `Shift+K` /
   tab its own WASM worker instead.
 - One main line per session; PGN variations are read as metadata, not stored as
   a tree.
-- No persistence database: state and the analysis cache live in memory for the
-  lifetime of the API object.
+- The archive is a local SQLite file (`state/chess_master.db`); the analysis
+  cache still lives in memory for the lifetime of the API object.
 - Review continuations are capped at 8 plies, and estimated Elo is a heuristic.
 - The HTTP API is for local development and is bound to `127.0.0.1`; it is not
   a remote service.

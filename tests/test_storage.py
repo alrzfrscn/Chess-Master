@@ -266,6 +266,16 @@ def test_load_missing_archive_returns_structured_error(api: ChessMasterApi) -> N
     assert response["error"]["code"] == "invalid_input"
 
 
+def test_cleared_archive_is_not_rearchived_by_new_game(api: ChessMasterApi) -> None:
+    _fools_mate(api)
+    assert api.clear_game_archive()["data"]["deleted"] == 1
+    assert api.list_archived_games()["data"]["total"] == 0
+
+    api.new_game("pass_play")
+    api.engine_poll()
+    assert api.list_archived_games()["data"]["total"] == 0
+
+
 def test_custom_clock_survives_a_timeout_archive(tmp_path: Path) -> None:
     api = ChessMasterApi(db_path=tmp_path / "clock.db")
     try:

@@ -330,3 +330,72 @@ def test_two_sessions_share_one_stockfish_worker(tmp_path) -> None:
         assert session_b.get_game_state()["data"]["total_plies"] == 1
     finally:
         manager.close()
+
+
+# -- CSRF guards ----------------------------------------------------------
+
+
+def _raw_post(
+    server: WebAppServer, method: str, headers: dict[str, str]
+) -> tuple[int, dict]:
+    body = json.dumps({"args": [], "kwargs": {}}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{server.url}api/{method}", data=body, method="POST", headers=headers
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def test_http_api_rejects_cross_site_posts(tmp_path) -> None:
+    api = ChessMasterApi(db_path=tmp_path / "csrf.db")
+    server = WebAppServer(WEB_ROOT, api, port=0, expose_api=True)
+    server.start()
+    try:
+        status, payload = _raw_post(
+            server, "get_game_state", {"Content-Type": "text/plain"}
+        )
+        assert status == 400
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "invalid_request"
+
+        status, payload = _raw_post(
+            server,
+            "get_game_state",
+            {"Content-Type": "application/json", "Origin": "http://evil.example"},
+        )
+        assert status == 403
+        assert payload["ok"] is False
+        assert payload["error"]["code"] == "forbidden_origin"
+    finally:
+        server.stop()
+        api._shutdown()
+
+
+def test_shared_link_visitor_cannot_mutate_owner_game(tmp_path) -> None:
+    manager = SessionManager(db_path=tmp_path / "share.db")
+    try:
+        session_a = manager.api_for("session-a", "client-a")
+        session_b = manager.api_for("session-b", "client-b")
+        game_a = _saved_game(session_a, "Owner", "e4")
+        owner_row = session_a._store.get_game(game_a)
+        assert owner_row is not None
+        pgn_before = owner_row["pgn"]
+
+        assert session_b.load_archived_game(game_a)["ok"] is True
+        # B plays on and saves the shared line; A's row must not change.
+        assert session_b.make_move("Nf3")["ok"] is True
+        assert session_b.save_current_game()["data"]["saved"] is True
+        stored = session_a._store.get_game(game_a)
+        assert stored["pgn"] == pgn_before
+        assert (stored["client_id"] or "local") == "client-a"
+
+        # B may read the share link, but never delete A's game.
+        deleted = session_b.delete_archived_game(game_a)["data"]
+        assert deleted["deleted"] is False
+        assert session_a._store.get_game(game_a) is not None
+        assert session_a.list_archived_games()["data"]["total"] == 1
+    finally:
+        manager.close()

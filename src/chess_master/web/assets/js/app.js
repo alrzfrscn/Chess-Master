@@ -1304,7 +1304,8 @@ function pollSoon(delay = 80) {
 
 async function pollEngine() {
   if (!app.game || app.pollBusy || app.busy || app.navigating || app.pendingPromotion) return;
-  if (document.querySelector("dialog[open]")) return;
+  // Engine Setup no longer pauses polling: bot moves and room updates keep arriving.
+  if (refs.newGameDialog?.open || refs.confirmDialog?.open) return;
   app.pollBusy = true;
   try {
     const result = await call("engine_poll");
@@ -1340,9 +1341,31 @@ async function pollEngine() {
   }
 }
 
+const ENGINE_POLL_ACTIVE_MS = 240;
+const ENGINE_POLL_IDLE_MS = 1000;
+
+/** SSE pushes an immediate poll on change, so an idle HTTP tab can poll slowly. */
+function enginePollDelay() {
+  const reviewRunning = ["queued", "running"].includes(app.game?.review?.status);
+  const idle =
+    app.bridgeMode === "http" &&
+    Boolean(app.eventStreamOff) &&
+    !app.game?.engine?.thinking &&
+    !reviewRunning;
+  return idle ? ENGINE_POLL_IDLE_MS : ENGINE_POLL_ACTIVE_MS;
+}
+
+function scheduleEnginePoll() {
+  window.clearTimeout(app.pollTimer);
+  app.pollTimer = window.setTimeout(async () => {
+    await pollEngine();
+    scheduleEnginePoll();
+  }, enginePollDelay());
+}
+
 function startEnginePolling() {
   if (app.pollTimer) return;
-  app.pollTimer = window.setInterval(pollEngine, 240);
+  scheduleEnginePoll();
   pollEngine();
 }
 

@@ -1404,6 +1404,8 @@ body.eval-hidden .eval-rail {
   background-size: 25% 25%;
   box-shadow: inset 0 0 32px rgba(8, 15, 11, 0.2);
   touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .board .cg-container {

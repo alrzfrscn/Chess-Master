@@ -173,6 +173,16 @@ class WebAppServer:
             def log_message(self, format: str, *args: object) -> None:  # noqa: A002
                 logger.debug("HTTP %s - %s", self.address_string(), format % args)
 
+            def _deny(self, status: HTTPStatus, code: str, message: str) -> None:
+                self._send_json(
+                    status,
+                    {
+                        "ok": False,
+                        "data": None,
+                        "error": {"code": code, "message": message},
+                    },
+                )
+
             def do_GET(self) -> None:  # noqa: N802
                 parsed = urlparse(self.path)
                 if parsed.path == "/api/health":
@@ -191,6 +201,37 @@ class WebAppServer:
                         {"ok": False, "data": None, "error": {"code": "not_found", "message": "Unknown route."}},
                     )
                     return
+                # A cross-site form can POST a simple content type without a CORS
+                # preflight.  Requiring JSON plus checking the browser's origin
+                # headers is the CSRF gate for the public web build.
+                content_type = (
+                    self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                )
+                if content_type != "application/json":
+                    self._deny(
+                        HTTPStatus.BAD_REQUEST,
+                        "invalid_request",
+                        "Content-Type must be application/json.",
+                    )
+                    return
+                if self.headers.get("Sec-Fetch-Site", "").strip().lower() == "cross-site":
+                    self._deny(
+                        HTTPStatus.FORBIDDEN,
+                        "forbidden_origin",
+                        "Cross-origin API requests are not allowed.",
+                    )
+                    return
+                origin = (self.headers.get("Origin") or "").strip()
+                host = self.headers.get("Host", "").strip().lower()
+                if origin and origin.lower() != "null" and host:
+                    if urlparse(origin).netloc.lower() != host:
+                        self._deny(
+                            HTTPStatus.FORBIDDEN,
+                            "forbidden_origin",
+                            "Cross-origin API requests are not allowed.",
+                        )
+                        return
+
                 if not expose_api:
                     self._send_json(
                         HTTPStatus.NOT_FOUND,
@@ -303,11 +344,10 @@ class WebAppServer:
                     )
                     return
                 requested = (parse_qs(query).get("session") or [""])[0]
+                session_token = requested or self.headers.get("X-Chess-Session")
+                client_token = self.headers.get("X-Chess-Client")
                 try:
-                    target = server._api_for(
-                        requested or self.headers.get("X-Chess-Session"),
-                        self.headers.get("X-Chess-Client"),
-                    )
+                    target = server._api_for(session_token, client_token)
                 except ValueError:
                     self._send_json(
                         HTTPStatus.BAD_REQUEST,
@@ -334,6 +374,13 @@ class WebAppServer:
                 last: dict[str, Any] | None = None
                 last_sent = time.monotonic()
                 while not server._closing.is_set():
+                    if session_token and getattr(target._engine, "detached", False):
+                        # The registry evicted this session; wake the new one
+                        # instead of streaming a detached coordinator forever.
+                        try:
+                            target = server._api_for(session_token, client_token)
+                        except ValueError:
+                            return
                     snapshot = _state_fingerprint(target)
                     if snapshot != last:
                         last = snapshot
@@ -408,6 +455,9 @@ class WebAppServer:
 def _state_fingerprint(api: ChessMasterApi) -> dict[str, Any]:
     """The smallest payload that tells a browser tab something changed."""
 
+    fast = getattr(api, "_state_fingerprint", None)
+    if callable(fast):
+        return fast()
     payload = api.get_game_state()
     state = (payload.get("data") or {}) if isinstance(payload, dict) else {}
     if not payload.get("ok"):

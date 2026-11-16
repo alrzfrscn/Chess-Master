@@ -1432,7 +1432,7 @@ class StockfishManager:
             board.push(move)
         return board
 
-    def _configure_analysis(self, engine: Any, multipv: int) -> None:
+    def _configure_analysis(self, engine: Any, multipv: int = 1) -> None:
         options: dict[str, Any] = {
             "Threads": WORKER_THREADS,
             "Hash": WORKER_HASH_MB,
@@ -1578,17 +1578,6 @@ class StockfishManager:
         return None
 
     # -- game review -----------------------------------------------------
-    def _configure_review(self, engine: Any, multipv: int) -> None:
-        options: dict[str, Any] = {
-            "Threads": WORKER_THREADS,
-            "Hash": WORKER_HASH_MB,
-            "UCI_LimitStrength": False,
-            "Skill Level": 20,
-        }
-        if "UCI_ShowWDL" in getattr(engine, "options", {}):
-            options["UCI_ShowWDL"] = True
-        engine.configure(options)
-
     def _review_search(self, engine: Any, job: EngineJob) -> Any:
         def search(board: chess.Board, depth: int, multipv: int) -> ReviewSearchResult | None:
             cached = self._cache.get_at_least(board.fen(), depth, multipv)
@@ -1603,7 +1592,7 @@ class StockfishManager:
                 )
             if not self._job_is_current(job):
                 return None
-            self._configure_review(engine, multipv)
+            self._configure_analysis(engine, multipv)
             infos = self._search_position(
                 engine,
                 board,

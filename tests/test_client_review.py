@@ -180,6 +180,20 @@ def test_complete_rejects_missing_browser_searches() -> None:
         api._shutdown()
 
 
+def test_confirm_positions_rejects_missing_browser_searches() -> None:
+    api = ChessMasterApi()
+    try:
+        assert_ok(api.new_game("pass_play"))
+        for uci in ("e2e4", "e7e5"):
+            assert_ok(api.make_move(uci))
+        response = api.find_review_confirm_positions("fast", {}, {"use_book": False})
+        assert response["ok"] is False
+        assert response["error"]["code"] == "invalid_input"
+        assert response["error"]["details"]["missing_positions"]
+    finally:
+        api._shutdown()
+
+
 def test_wasm_is_served_with_the_right_mime_type() -> None:
     api = ChessMasterApi()
     server = WebAppServer(WEB_ROOT, api, port=0)

@@ -57,6 +57,12 @@ GAME_COLUMNS: tuple[str, ...] = (
     "client_id",
 )
 
+# The archive list ships one row per game to the browser; moves_json and
+# headers_json are only needed when a game is actually opened.
+_LIST_COLUMNS = tuple(
+    column for column in GAME_COLUMNS if column not in {"moves_json", "headers_json"}
+)
+
 # A plain re-archive (opening another game) carries no review metrics.  Keep the
 # values a completed review already stored instead of overwriting them with NULL.
 _REVIEW_COLUMNS = frozenset(
@@ -191,7 +197,9 @@ class GameStore:
         with self._lock:
             self._conn.execute(
                 f"INSERT INTO games ({columns}) VALUES ({placeholders}) "
-                f"ON CONFLICT(game_id) DO UPDATE SET {updates}",
+                f"ON CONFLICT(game_id) DO UPDATE SET {updates} "
+                "WHERE COALESCE(games.client_id, 'local') "
+                "= COALESCE(excluded.client_id, 'local')",
                 [row[column] for column in GAME_COLUMNS],
             )
             self._conn.commit()
@@ -239,15 +247,22 @@ class GameStore:
                 self._conn.execute(f"SELECT COUNT(*) FROM games{clause}", params).fetchone()[0]
             )
             rows = self._conn.execute(
-                f"SELECT * FROM games{clause} ORDER BY updated_at DESC, created_at DESC "
-                "LIMIT ? OFFSET ?",
+                f"SELECT {', '.join(_LIST_COLUMNS)} FROM games{clause} "
+                "ORDER BY updated_at DESC, created_at DESC LIMIT ? OFFSET ?",
                 [*params, limit, offset],
             ).fetchall()
         return [dict(row) for row in rows], total
 
-    def delete_game(self, game_id: str) -> bool:
+    def delete_game(self, game_id: str, client_id: str | None = None) -> bool:
+        scope = ""
+        params: list[Any] = [str(game_id)]
+        if client_id is not None:
+            scope = " AND COALESCE(client_id, 'local') = ?"
+            params.append(str(client_id))
         with self._lock:
-            cursor = self._conn.execute("DELETE FROM games WHERE game_id = ?", (str(game_id),))
+            cursor = self._conn.execute(
+                f"DELETE FROM games WHERE game_id = ?{scope}", params
+            )
             self._conn.commit()
             return cursor.rowcount > 0
 
@@ -270,8 +285,24 @@ class GameStore:
                 self._conn.execute("DELETE FROM reviews")
                 self._conn.execute("DELETE FROM games")
             self._conn.commit()
-            self._conn.execute("VACUUM")
+        self._vacuum()
         return deleted
+
+    def _vacuum(self) -> None:
+        """Reclaim free pages without holding the store lock during VACUUM."""
+
+        if self.path == ":memory:":
+            return
+        try:
+            conn = sqlite3.connect(str(self.path), timeout=5.0)
+            try:
+                conn.execute("VACUUM")
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            # shortcut: a busy database keeps its free pages; the next clear
+            # retries the vacuum. Never fail a successful delete over it.
+            pass
 
     # -- reviews ---------------------------------------------------------
     def save_review(
@@ -283,9 +314,19 @@ class GameStore:
         schema_version: int | None,
         report: Mapping[str, Any] | str,
         completed_at: str | None = None,
+        client_id: str | None = None,
     ) -> None:
         payload = report if isinstance(report, str) else json.dumps(report, ensure_ascii=False)
         with self._lock:
+            if client_id is not None:
+                owner = self._conn.execute(
+                    "SELECT 1 FROM games WHERE game_id = ? "
+                    "AND COALESCE(client_id, 'local') = ?",
+                    (str(game_id), str(client_id)),
+                ).fetchone()
+                if owner is None:
+                    # A share-link visitor must not attach a review to the owner's row.
+                    return
             self._conn.execute(
                 "INSERT INTO reviews "
                 "(game_id, signature, preset, schema_version, completed_at, report_json) "
